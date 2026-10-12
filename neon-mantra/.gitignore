@@ -1,0 +1,3 @@
+# rendered media is regenerable (make_audio.py + make_video.py); only the cover is versioned
+out/*
+!out/cover_9x16.jpg
