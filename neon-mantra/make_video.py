@@ -1,7 +1,7 @@
 """NEON MANTRA - procedural cyberpunk x Indian-classical music video.
 
 Reads out/neon_mantra.wav + out/timeline.json (from make_audio.py) and renders
-a 9:16 vertical video (1080x1920, 30 fps) where every light, camera move and
+a 9:16 vertical video (1080x1920, 30 fps, as long as the track) where every light, camera move and
 dance step is locked to the track:
   neon gopuram + cyberpunk skyline, rotating neon mandala, synthwave floor grid,
   three Bharatanatyam/Kathak-style neon dancers (spins on the drop), jumping crowd
@@ -32,8 +32,12 @@ NFR = int(DUR * FPS)
 KICKS = np.array([e["t"] for e in TL["events"] if e["type"] == "kick"])
 HITS = np.array([e["t"] for e in TL["events"] if e["type"] in ("dhol", "clap", "snare", "tabla")])
 SITAR = np.array([e["t"] for e in TL["events"] if e["type"] == "sitar"])
+KEYS = np.array([e["t"] for e in TL["events"] if e["type"] == "keys"])
+ACID = np.array([e["t"] for e in TL["events"] if e["type"] == "acid"])
 RMS, LOW = np.array(TL["rms"]), np.array(TL["low"])
-DROP = next(s["start"] for s in TL["sections"] if s["name"] == "drop")
+DROPS = [s["start"] for s in TL["sections"] if s["name"] == "drop"]
+DROP = DROPS[0]
+FIRST_BUILD = next(s["start"] for s in TL["sections"] if s["name"] == "build")
 
 FONT_B = "/usr/share/fonts/opentype/inter/InterDisplay-Bold.otf"
 FONT_X = "/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf"
@@ -261,10 +265,13 @@ def render(i):
     kick = math.exp(-dk / 0.12) if dk < 1 else 0.0
     hit = math.exp(-since(HITS, t) / 0.08)
     sit = math.exp(-since(SITAR, t) / 0.15)
+    keys = math.exp(-since(KEYS, t) / 0.2)
+    acid = math.exp(-since(ACID, t) / 0.06)
     drop = sec == "drop"
-    impact = math.exp(-(t - DROP) / 0.6) if t >= DROP else 0.0
+    last_drop = max([d for d in DROPS if d <= t], default=-99.0)
+    impact = math.exp(-(t - last_drop) / 0.6) if t >= last_drop else 0.0
     beat = t / BEAT
-    hype = {"hook": 0.35, "groove": 0.75, "build": 0.6 + 0.4 * sp, "drop": 1.0, "outro": 0.6}[sec]
+    hype = {"hook": 0.35, "groove": 0.75, "build": 0.6 + 0.4 * sp, "drop": 1.0, "break": 0.3, "outro": 0.6}[sec]
 
     # section color mood
     hue_cycle = [MAG, CYA, SAF, VIO]
@@ -294,7 +301,7 @@ def render(i):
             ang = math.pi / 2 + math.sin(t * (1.3 if drop else 0.6) + k * 1.7) * 0.6
             ex, ey = ox + math.cos(ang) * 1600, -20 + math.sin(ang) * 1600
             col = (ca if k % 2 else cb)
-            br = (0.35 + 0.65 * kick) * hype * (1.0 if drop else 0.6)
+            br = (0.35 + 0.65 * max(kick, 0.6 * acid)) * hype * (1.0 if drop else 0.6)
             dg.line([(ox, -20), (ex, ey)], fill=c255(col, br), width=3)
 
     # mandala
@@ -302,7 +309,7 @@ def render(i):
     msz = int(900 * mz)
     rot = t * (24 if drop else 9)
     m = MANDALA.rotate(rot, resample=Image.BILINEAR).resize((msz, msz), Image.BILINEAR)
-    mc = (ca * 0.6 + SAF * 0.4) * (0.35 + 0.5 * kick * hype + 0.3 * sit)
+    mc = (ca * 0.6 + SAF * 0.4) * (0.35 + 0.5 * kick * hype + 0.3 * sit + 0.25 * keys)
     mcol = Image.merge("RGB", [m.point(lambda v, k=k: int(v * mc[k])) for k in range(3)])
     glow.paste(mcol, (W // 2 - msz // 2, 500 - msz // 2), m)
 
@@ -402,13 +409,19 @@ def render(i):
         n = 4 - int(sp * 4)
         f = (sp * 4) % 1
         caption(str(n), 240, int(150 + 60 * (1 - f)), SAF)
-    elif drop and t - DROP < 1.2:
-        caption("DROP", 200, int(200 - 60 * min(1, (t - DROP) * 3)), ca)
+    elif drop and t - last_drop < 1.2:
+        caption("DROP", 200, int(200 - 60 * min(1, (t - last_drop) * 3)), ca)
     elif drop:
         caption("NEON MANTRA", 120, 54, ca)
-    elif sec == "groove":
+    elif sec == "groove" and t < FIRST_BUILD:
         caption("sitar + tabla + dhol", 150, 44, CYA)
         caption("x 128 BPM techno", 210, 44, MAG)
+    elif sec == "groove":
+        caption("acid synth + wah-wah", 150, 44, CYA)
+        caption("+ clipping", 210, 44, MAG)
+    elif sec == "break":
+        caption("keys + phaser + echo", 150, 44, VIO)
+        caption("feel the mantra", 210, 40, SAF, fpath=FONT_B)
     if sec == "outro" and sp >= 0.75:
         caption("LOOP IT", 170, 90, SAF, wob=math.sin(t * 25) * 3)
         caption("save + share", 290, 40, CYA)

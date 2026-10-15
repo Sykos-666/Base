@@ -1,8 +1,9 @@
 # NEON MANTRA — Kit di lancio virale + SEO
 
-**Formato:** verticale 9:16 · 1080×1920 · 30 fps · 60 s esatti, in loop senza stacchi
+**Formato:** verticale 9:16 · 1080×1920 · 30 fps · durata casuale da 64 a 160 battute (da 2:00 a 5:00), in loop senza stacchi
 **Traccia:** Indo-techno · 128 BPM · scala D Bhairav (Re Mi♭ Fa♯ Sol La Si♭ Do)
-**File:** `out/NEON_MANTRA_9x16.mp4` · copertina `out/cover_9x16.jpg` · audio `out/neon_mantra.wav`
+**Strumenti:** sitar, tabla, dhol, tanpura · piano elettrico FM (stile Rhodes), synth acid 303, arpeggiatore, pad supersaw, lead supersaw · effetti: clipping, wah-wah, phaser, echo ping-pong
+**File:** `out/NEON_MANTRA_9x16.mp4` · copertina `out/cover_9x16.jpg` · audio `out/neon_mantra.wav` · capitoli `out/chapters.txt`
 
 ---
 
@@ -14,9 +15,11 @@
 | 0:07–0:22 | **GROOVE** | Cassa 4/4, basso techno in levare, chaal bhangra del dhol, laser | "sitar + tabla + dhol x 128 BPM techno" |
 | 0:22–0:30 | **BUILD** | Rullante che accelera, riser, conto alla rovescia 4-3-2-1 | "WAIT FOR THE DROP" + numeri |
 | **0:30** | **DROP** | Flash bianco, whip-zoom, i petali esplodono, supersaw sul riff di sitar, strobo sulle casse, giravolte delle danzatrici | "DROP" → "NEON MANTRA" |
-| 0:52–0:60 | **OUTRO/LOOP** | Si torna all'hook, così il video riparte senza stacchi (più rewatch) | "LOOP IT / save + share" |
+| 0:52–1:07 | **BREAK** | Niente cassa: piano elettrico con phaser, pad, sitar con wah-wah ed echo, l'acid sale filtrato | "keys + phaser + echo" |
+| … | **GROOVE → BUILD → DROP → BREAK** | Il ciclo si ripete finché la durata casuale lo consente; dal 2° groove entra il synth acid con clipping | "acid synth + wah-wah + clipping" |
+| ultime 4 battute | **OUTRO/LOOP** | Si torna all'hook, così il video riparte senza stacchi (più rewatch) | "LOOP IT / save + share" |
 
-Il drop cade a metà (0:30) di proposito: chi guarda resta fino in fondo per sentirlo, e il loop spinge il tempo di visione medio oltre il 100%.
+Il primo minuto è sempre uguale (hook, primo drop a 0:30, break a 0:52), qualunque sia la lunghezza: è quello il taglio da usare per Shorts, Reels e TikTok. La versione intera va su YouTube come video normale, con i capitoli generati automaticamente in `out/chapters.txt`.
 
 ---
 
@@ -43,11 +46,13 @@ NEON MANTRA 🔥 Indian classical meets hard techno: sitar, tabla and dhol over 
 🎧 Indian Techno · Desi Techno · Bollywood Techno · Sitar Techno · Dhol Techno · Psytrance vibes
 🎵 128 BPM · D Bhairav raag · Sitar x Tabla x Dhol x Techno bass
 
+(incolla qui il contenuto di out/chapters.txt: i capitoli cambiano con la durata, es.)
 00:00 Sitar hook
-00:07 Techno groove + Dhol bhangra chaal
+00:07 Techno groove + dhol + keys
 00:22 Build-up
 00:30 THE DROP
-00:52 Loop
+00:52 Breakdown: keys, phaser, echo
+...
 
 Comment your country 🌍 and tag someone who needs this in their gym playlist.
 
@@ -90,8 +95,9 @@ indian techno, desi techno, sitar techno, dhol techno, indian classical techno, 
 - **Primi 60 minuti:** fissa un commento come *"0:30 🤯 what country are you listening from?"*. Le domande sul paese generano molti commenti.
 - **Trend audio:** su TikTok e Instagram carica la traccia come **suono originale** chiamato *"NEON MANTRA – Indian Techno (wait for 0:30)"*, così altri creator possono riusarla. Il tempo dell'hook (0:00–0:07) e del drop (0:30) funziona bene per transizioni e cambi d'outfit.
 - **Remix e duetti:** stitch e duetti di ballerini, DJ e suonatori di dhol estendono la portata.
-- **Varianti da tagliare dallo stesso file:** 15 s (0:22–0:37, solo build e drop) e 30 s (0:15–0:45).
+- **Varianti da tagliare dallo stesso file:** 60 s per Shorts/Reels (0:00–1:00), 15 s (0:22–0:37, solo build e drop) e 30 s (0:15–0:45).
   ```
+  ffmpeg -t 60 -i out/NEON_MANTRA_9x16.mp4 -c copy NEON_MANTRA_60s.mp4
   ffmpeg -ss 22 -t 15 -i out/NEON_MANTRA_9x16.mp4 -c copy NEON_MANTRA_15s.mp4
   ```
 - **Collegamento con i brani lunghi:** distribuisci la traccia (DistroKid, Spotify, Apple Music) con lo stesso titolo e linka lo Short alla versione lunga.
@@ -102,11 +108,14 @@ indian techno, desi techno, sitar techno, dhol techno, indian classical techno, 
 
 ```
 pip install numpy scipy pillow     # + ffmpeg
-python3 make_audio.py              # -> out/neon_mantra.wav + out/timeline.json
+python3 make_audio.py              # traccia nuova, durata casuale 64-160 battute -> out/neon_mantra.wav + timeline.json + chapters.txt
+python3 make_audio.py --seed 534020836       # rigenera esattamente la stessa traccia (il seed viene stampato a fine esecuzione)
+python3 make_audio.py --bars 96              # forza la durata
 python3 make_video.py              # -> out/NEON_MANTRA_9x16.mp4 + out/cover_9x16.jpg
 python3 make_video.py --preview 1,30.2,40   # solo fotogrammi PNG di prova
 ```
 
-- Tempo, scala e struttura: costanti `BPM`, `SC`, `SECTIONS`, `HOOK` in `make_audio.py`.
+- Tempo, scala e struttura: costanti `BPM`, `SC`, `HOOK`, `CHORDS` e la funzione `build_sections()` in `make_audio.py`.
+- Effetti: `hardclip()`, `wah()`, `phaser()`, `echo()` in `make_audio.py`, applicati nella sezione "effects bus".
 - Colori, testi a schermo e passi di danza: `MAG/CYA/SAF`, `caption(...)`, `POSES` in `make_video.py`.
 - Musica e immagini sono sintetizzate da zero (niente campioni né footage di terzi), quindi non ci sono problemi di copyright o Content ID.
