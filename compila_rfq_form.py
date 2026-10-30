@@ -10,7 +10,7 @@ Funzionalità:
 - diagnosi volume zero
 - repair automatico shell/solidi
 - repair con tolleranze multiple
-- spessore medio più robusto
+- spessore pareti con ray-casting (nominale, medio, massimo)
 - soglia massima spessore da CSV
 - log su file
 - analisi separata per singolo corpo se assembly/multibody
@@ -19,10 +19,10 @@ Funzionalità:
 import os
 import re
 import copy
-import shutil
 import csv
 import traceback
 import math
+import random
 import logging
 from datetime import datetime
 from types import SimpleNamespace
@@ -30,10 +30,11 @@ from statistics import mean, median
 
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
+from openpyxl.worksheet.cell_range import CellRange
 
 import cadquery as cq
 
-from OCP.BRepGProp import BRepGProp
+from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.GProp import GProp_GProps
 from OCP.TopAbs import (
     TopAbs_SOLID,
@@ -41,8 +42,6 @@ from OCP.TopAbs import (
     TopAbs_COMPOUND,
     TopAbs_SHELL,
     TopAbs_FACE,
-    TopAbs_IN,
-    TopAbs_OUT,
 )
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
@@ -51,8 +50,14 @@ from OCP.ShapeFix import ShapeFix_Shape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS
-from OCP.BRepClass3d import BRepClass3d_SolidClassifier
-from OCP.gp import gp_Pnt
+from OCP.BRep import BRep_Tool, BRep_Builder
+from OCP.TopoDS import TopoDS_Compound
+from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.TopLoc import TopLoc_Location
+from OCP.IntCurvesFace import IntCurvesFace_ShapeIntersector
+from OCP.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Lin
 
 try:
     import cairosvg
@@ -66,7 +71,6 @@ except Exception:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PATH_SETTINGS = os.path.join(BASE_DIR, "settings.csv")
-PATH_TEMPLATE = os.path.join(BASE_DIR, "RFQ_mods_form.xlsx")
 PATH_INPUT = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR_VISTE = os.path.join(BASE_DIR, "viste")
 LOG_FILE = os.path.join(BASE_DIR, "analisi.log")
@@ -90,12 +94,46 @@ REPAIR_TOLERANCES = [
 # Valore usato se il CSV non definisce una soglia massima.
 DEFAULT_MAX_THICKNESS_MM = 150.0
 
-# Parametri campionamento spessore locale.
-THICKNESS_TOL = 1e-4
-THICKNESS_MAX_SAMPLES = 48
+# Parametri misura spessore (ray-casting).
+# Numero di raggi per corpo: i punti di partenza sono distribuiti
+# uniformemente sulla superficie (campionamento pesato sull'area).
+THICKNESS_RAY_COUNT = 3000
+# Angolo massimo tra il raggio e la normale della parete opposta:
+# oltre questo valore il raggio ha colpito una parete laterale
+# (spigoli, raccordi) e il campione viene scartato.
+THICKNESS_MAX_EXIT_ANGLE_DEG = 45.0
+# Distanza minima per ignorare l'intersezione con la faccia di partenza.
+THICKNESS_MIN_MM = 1e-3
+# Se diametro sfera inscritta / lunghezza raggio è sotto questa soglia,
+# il raggio non ha attraversato una parete e viene scartato.
+THICKNESS_SPHERE_RATIO = 0.5
+# Seme fisso: risultati ripetibili a ogni esecuzione.
+THICKNESS_RANDOM_SEED = 12345
 
 # Se True, gli assembly/multibody vengono analizzati corpo per corpo.
 PROCESS_ASSEMBLY_BODIES_SEPARATELY = True
+
+
+# =========================================================================
+# CONFIGURAZIONE TEMPLATE EXCEL
+# =========================================================================
+# Nomi cercati nella cartella dello script, in ordine di priorità.
+# Se nessuno esiste, viene cercato un qualsiasi file "*rfq*form*.xls*".
+TEMPLATE_CANDIDATES = [
+    "RFQ_molds_form.xlsx",
+    "RFQ_molds_form.xlsm",
+    "RFQ_molds_form.xltx",
+]
+
+# Nome del foglio del form. None = foglio attivo del template.
+TEMPLATE_SHEET_NAME = None
+
+# Prima riga dati del form e cella della data.
+DATA_START_ROW = 3
+DATE_CELL = "E5"
+
+# Colonna Excel per lo spessore massimo (es. "M"). None = non scritto.
+THICKNESS_MAX_COLUMN = None
 
 
 # =========================================================================
@@ -251,6 +289,29 @@ def wrap_cq(wrapped):
         return None
 
 
+def gprop_call(name, wrapped, props):
+    """
+    Chiama un metodo statico di BRepGProp (VolumeProperties, SurfaceProperties).
+
+    Nel binding OCP (usato da CadQuery) i metodi statici hanno il suffisso
+    '_s' (es. BRepGProp.VolumeProperties_s): chiamare la versione senza
+    suffisso solleva AttributeError. Il fallback senza suffisso resta per
+    compatibilità con pythonocc.
+    """
+    fn = getattr(BRepGProp, name + "_s", None) or getattr(BRepGProp, name)
+    fn(wrapped, props)
+    return props
+
+
+def signed_volume(wrapped):
+    """
+    Volume con segno: negativo se il solido è orientato al contrario
+    (normali delle facce verso l'interno).
+    """
+    props = gprop_call("VolumeProperties", wrapped, GProp_GProps())
+    return float(props.Mass())
+
+
 def occ_signature(wrapped):
     """
     Firma geometrica semplice per ridurre duplicati.
@@ -260,8 +321,7 @@ def occ_signature(wrapped):
         return None
 
     try:
-        props = GProp_GProps()
-        BRepGProp.VolumeProperties(wrapped, props)
+        props = gprop_call("VolumeProperties", wrapped, GProp_GProps())
         c = props.CentreOfMass()
         return (
             round(float(props.Mass()), 6),
@@ -360,7 +420,7 @@ def combine_shapes(shapes):
         return shapes[0]
 
 
-def safe_volume(shape, tol=1e-5):
+def safe_volume(shape):
     """
     Calcola il volume in modo robusto usando direttamente OpenCASCADE.
     Ritorna 0.0 se il volume non è calcolabile.
@@ -400,25 +460,14 @@ def safe_volume(shape, tol=1e-5):
         except Exception:
             pass
 
-    props = GProp_GProps()
-
     try:
-        if tol:
-            BRepGProp.VolumeProperties(wrapped, props, tol)
-        else:
-            BRepGProp.VolumeProperties(wrapped, props)
-        return abs(float(props.Mass()))
-    except TypeError:
-        try:
-            BRepGProp.VolumeProperties(wrapped, props)
-            return abs(float(props.Mass()))
-        except Exception:
-            return 0.0
-    except Exception:
+        return abs(signed_volume(wrapped))
+    except Exception as e:
+        logger.debug(f"Volume non calcolabile: {e}")
         return 0.0
 
 
-def safe_surface_area(shape, tol=1e-5):
+def safe_surface_area(shape):
     """
     Calcola l'area superficiale in modo robusto usando direttamente OpenCASCADE.
     Ritorna 0.0 se non calcolabile.
@@ -436,21 +485,11 @@ def safe_surface_area(shape, tol=1e-5):
     except Exception:
         return 0.0
 
-    props = GProp_GProps()
-
     try:
-        if tol:
-            BRepGProp.SurfaceProperties(wrapped, props, tol)
-        else:
-            BRepGProp.SurfaceProperties(wrapped, props)
+        props = gprop_call("SurfaceProperties", wrapped, GProp_GProps())
         return abs(float(props.Mass()))
-    except TypeError:
-        try:
-            BRepGProp.SurfaceProperties(wrapped, props)
-            return abs(float(props.Mass()))
-        except Exception:
-            return 0.0
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Area non calcolabile: {e}")
         return 0.0
 
 
@@ -747,6 +786,83 @@ def copy_row_formatting(source_ws, source_row, target_row):
             target_cell.alignment = copy.copy(source_cell.alignment)
 
 
+def insert_row_keep_layout(ws, row_idx):
+    """
+    Inserisce una riga come ws.insert_rows(), ma sposta anche celle unite
+    e altezze righe sottostanti: openpyxl non lo fa, e senza questo il
+    layout del template (intestazioni, note, piè di pagina) si rompe.
+    """
+    merged_below = [
+        str(rng) for rng in ws.merged_cells.ranges
+        if rng.min_row >= row_idx
+    ]
+    for ref in merged_below:
+        ws.unmerge_cells(ref)
+
+    heights = {
+        r: dim.height
+        for r, dim in ws.row_dimensions.items()
+        if r >= row_idx and dim.height is not None
+    }
+
+    ws.insert_rows(row_idx)
+
+    for ref in merged_below:
+        rng = CellRange(ref)
+        rng.shift(row_shift=1)
+        ws.merge_cells(rng.coord)
+
+    for r in sorted(heights, reverse=True):
+        ws.row_dimensions[r + 1].height = heights[r]
+    ws.row_dimensions[row_idx].height = ws.row_dimensions[row_idx - 1].height
+
+
+def find_template_path():
+    """
+    Cerca il template RFQ nella cartella dello script.
+    Ritorna il percorso, oppure None se non trovato.
+    """
+    try:
+        files = os.listdir(BASE_DIR)
+    except Exception:
+        return None
+
+    by_lower = {f.lower(): f for f in files}
+
+    for name in TEMPLATE_CANDIDATES:
+        real = by_lower.get(name.lower())
+        if real:
+            return os.path.join(BASE_DIR, real)
+
+    for f in sorted(files):
+        low = f.lower()
+        if (
+            "rfq" in low and "form" in low
+            and low.endswith((".xlsx", ".xlsm", ".xltx"))
+            and not low.startswith("~$")
+        ):
+            return os.path.join(BASE_DIR, f)
+
+    return None
+
+
+def open_template(template_path):
+    """
+    Apre il template mantenendone il formato.
+    Ritorna (workbook, estensione output).
+    """
+    ext = os.path.splitext(template_path)[1].lower()
+    keep_vba = ext == ".xlsm"
+
+    wb = openpyxl.load_workbook(template_path, keep_vba=keep_vba)
+
+    if ext == ".xltx":
+        # Salva come cartella di lavoro normale, non come modello.
+        wb.template = False
+
+    return wb, (".xlsm" if keep_vba else ".xlsx")
+
+
 # =========================================================================
 # DIAGNOSTICA / REPORT
 # =========================================================================
@@ -761,9 +877,7 @@ def log_geometry_report(
     faces,
     used_volume,
     used_surface,
-    thickness_value,
-    thickness_method,
-    thickness_samples_count,
+    thickness,
     cfg_max_thickness,
     effective_max_thickness,
     repair_note,
@@ -796,11 +910,24 @@ def log_geometry_report(
     lines.append(f"Solidi riparati: {len(repaired_solids)}")
     lines.append(f"Solidi usati: {len(used_solids)}")
     lines.append(f"Facce usate: {len(faces)}")
-    lines.append(f"Volume usato: {used_volume}")
-    lines.append(f"Superficie usata: {used_surface}")
-    lines.append(f"Spessore calcolato: {thickness_value}")
-    lines.append(f"Metodo spessore: {thickness_method}")
-    lines.append(f"Campioni spessore validi: {thickness_samples_count}")
+    lines.append(f"Volume usato: {used_volume:.3f} mm3")
+    lines.append(f"Superficie usata: {used_surface:.3f} mm2")
+    lines.append(f"Metodo spessore: {thickness.method}")
+    lines.append(
+        f"Raggi validi: {thickness.samples}/{thickness.rays} "
+        f"({thickness.coverage:.0%} della superficie)"
+    )
+    lines.append(f"Spessore nominale (mediana): {thickness.nominal:.3f} mm")
+    lines.append(f"Spessore medio: {thickness.mean:.3f} mm")
+    lines.append(
+        f"Spessore P2 / P10 / P90 / P98 / max: "
+        f"{thickness.p2:.3f} / {thickness.p10:.3f} / "
+        f"{thickness.p90:.3f} / {thickness.p98:.3f} / {thickness.max:.3f} mm"
+    )
+    if thickness.histogram:
+        lines.append("Distribuzione spessori (% superficie):")
+        for label, pct in thickness.histogram:
+            lines.append(f"  {label:>16} mm: {pct:5.1f}%")
     lines.append(f"Max spessore da CSV: {cfg_max_thickness}")
     lines.append(f"Max spessore effettivo: {effective_max_thickness}")
     lines.append(f"Nota repair: {repair_note}")
@@ -825,10 +952,8 @@ def log_geometry_report(
 
     text = "\n".join(lines)
 
-    logger.info(text)
-
     if DEBUG_GEOMETRY:
-        print(text)
+        logger.info(text)
 
 
 # =========================================================================
@@ -1147,264 +1272,353 @@ def try_repair_to_solids_multi(top_shapes, tolerances=None):
 
 
 # =========================================================================
-# SPESSORE MEDIO PIÙ ROBUSTO
+# SPESSORE PARETI (RAY-CASTING)
 # =========================================================================
-def make_solid_classifier(wrapped):
-    """
-    Crea un classificatore punto-dentro/solido.
-    """
-    try:
-        return BRepClass3d_SolidClassifier(wrapped)
-    except Exception:
-        classifier = BRepClass3d_SolidClassifier()
-        classifier.Load(wrapped)
-        return classifier
+#
+# Metodo:
+# 1. si campionano N punti distribuiti uniformemente sulla superficie del
+#    solido (ogni punto rappresenta la stessa area);
+# 2. da ogni punto si lancia un raggio verso l'interno, lungo la normale
+#    esatta della superficie;
+# 3. la distanza dalla prima parete incontrata è lo spessore locale;
+# 4. il campione è valido solo se la parete d'uscita è "opposta" (la sua
+#    normale è quasi parallela al raggio): così si scartano i raggi che
+#    entrano in una parete laterale invece di attraversare il materiale;
+# 5. controllo "sfera inscritta": si misura il diametro della sfera più
+#    grande centrata a metà raggio. Se è molto più piccolo del raggio,
+#    il raggio ha corso lungo una parete invece di attraversarla (es.
+#    partito dal fianco stretto di una lastra, o dal fondo sotto una
+#    nervatura) e il campione viene scartato. Senza questo controllo i
+#    fianchi gonfierebbero media e massimo.
+#
+# Poiché i punti sono pesati sull'area, la mediana dei campioni è lo
+# spessore nominale "della maggior parte del pezzo", poco sensibile a
+# nervature, borchie e zone massive locali.
+
+THICKNESS_HISTOGRAM_EDGES = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0,
+    float("inf"),
+]
 
 
-def _classify_point(classifier, x, y, z, tol=THICKNESS_TOL):
-    try:
-        return classifier.Perform(gp_Pnt(x, y, z), tol)
-    except Exception:
+def _vec_norm(x, y, z):
+    length = math.sqrt(x * x + y * y + z * z)
+    if length < 1e-12:
         return None
+    return (x / length, y / length, z / length)
 
 
-def _state_at_offset(classifier, base, direction, dist, tol=THICKNESS_TOL):
-    x = base[0] + direction[0] * dist
-    y = base[1] + direction[1] * dist
-    z = base[2] + direction[2] * dist
-    return _classify_point(classifier, x, y, z, tol)
-
-
-def _find_inside_direction(classifier, base, normal, tol=THICKNESS_TOL):
+def face_normal_at(evaluator, u, v):
     """
-    Prova a capire quale direzione della normale entra nel solido.
-    Ritorna un vettore direzione oppure None.
+    Punto e normale (uscente, unitaria) di una faccia nei parametri (u, v).
+    BRepGProp_Face tiene conto dell'orientamento della faccia nel solido.
     """
-    offsets = [tol * 10.0, tol * 100.0, 0.01, 0.1, 1.0]
+    pnt = gp_Pnt()
+    nrm = gp_Vec()
+    evaluator.Normal(u, v, pnt, nrm)
 
-    for sign in (-1.0, 1.0):
-        direction = (
-            normal[0] * sign,
-            normal[1] * sign,
-            normal[2] * sign,
-        )
+    n = _vec_norm(nrm.X(), nrm.Y(), nrm.Z())
+    if n is None:
+        return None, None
 
-        for off in offsets:
-            state = _state_at_offset(classifier, base, direction, off, tol)
-            if state == TopAbs_IN:
-                return direction
-
-    return None
+    return (pnt.X(), pnt.Y(), pnt.Z()), n
 
 
-def measure_local_thicknesses(
-    solid,
-    max_samples=THICKNESS_MAX_SAMPLES,
-    max_thickness=None,
-    tol=THICKNESS_TOL,
-):
+def make_shells_compound(solid_occ):
     """
-    Misura uno spessore locale campionando alcune facce.
-
-    Metodo:
-    - prende una faccia
-    - prova a entrare nel solido lungo la normale
-    - cerca il punto in cui riesce dall'altra parte
-    - stima la distanza come spessore locale
-
-    Ritorna una lista di spessori validi.
+    Compound con le shell del solido: serve per la distanza punto-superficie
+    (con il solido, un punto interno avrebbe distanza 0).
     """
-    wrapped = wrap_occ(solid)
-    if wrapped is None:
-        return []
+    comp = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(comp)
 
-    try:
-        st = wrapped.ShapeType()
-    except Exception:
-        return []
+    for shell in explore_shapes_by_type(solid_occ, TopAbs_SHELL):
+        builder.Add(comp, shell)
 
-    if st not in (TopAbs_SOLID, TopAbs_COMPSOLID):
-        return []
+    return comp
 
-    if max_thickness is None:
-        max_thickness = max(50.0, bbox_diagonal([solid]))
 
-    try:
-        classifier = make_solid_classifier(wrapped)
-    except Exception:
-        return []
+def distance_to_surface(point, surface_occ):
+    """Distanza minima tra un punto e la superficie del solido."""
+    vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
+    dist = BRepExtrema_DistShapeShape(vertex, surface_occ)
+    if not dist.IsDone():
+        return None
+    return float(dist.Value())
 
-    faces = collect_faces([solid])
-    if not faces:
-        return []
 
-    try:
-        faces = sorted(faces, key=lambda f: safe_face_area(f), reverse=True)
-    except Exception:
-        pass
+def to_topods_face(shape):
+    """Converte una TopoDS_Shape in TopoDS_Face."""
+    fn = getattr(TopoDS, "Face_s", None) or getattr(TopoDS, "Face")
+    return fn(shape)
 
-    samples = []
-    attempts = 0
-    max_attempts = max_samples * 4
 
-    for face in faces:
-        if len(samples) >= max_samples:
-            break
+def sample_surface_points(solid_occ, count, rng, mesh_tol):
+    """
+    Campiona 'count' punti distribuiti uniformemente sulla superficie.
 
-        if attempts >= max_attempts:
-            break
+    La triangolazione serve solo a sapere DOVE campionare (scelta dei
+    triangoli pesata sull'area): le coordinate UV del punto vengono
+    interpolate dai nodi UV del triangolo, poi punto e normale vengono
+    valutati sulla superficie esatta, senza errori di discretizzazione.
 
-        attempts += 1
+    Ritorna una lista di (punto, normale_uscente).
+    """
+    BRepMesh_IncrementalMesh(solid_occ, mesh_tol, False, 0.5, True)
 
+    triangles = []
+    weights = []
+
+    for face_shape in explore_shapes_by_type(solid_occ, TopAbs_FACE):
         try:
-            c = face.Center()
-            n = face.normalAt()
-
-            base = (float(c.x), float(c.y), float(c.z))
-            normal = (float(n.x), float(n.y), float(n.z))
+            face = to_topods_face(face_shape)
+            poly = BRep_Tool.Triangulation_s(face, TopLoc_Location())
         except Exception:
             continue
 
-        norm_len = math.sqrt(normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2)
-        if norm_len < 1e-9:
+        if poly is None or not poly.HasUVNodes():
             continue
 
-        normal = (
-            normal[0] / norm_len,
-            normal[1] / norm_len,
-            normal[2] / norm_len,
-        )
+        evaluator = BRepGProp_Face(face)
 
-        inside_dir = _find_inside_direction(classifier, base, normal, tol)
-        if inside_dir is None:
-            continue
+        for i in range(1, poly.NbTriangles() + 1):
+            n1, n2, n3 = poly.Triangle(i).Get()
+            p1, p2, p3 = poly.Node(n1), poly.Node(n2), poly.Node(n3)
 
-        # Trova un punto sicuramente dentro il materiale
-        lo_candidates = [max(tol * 10.0, 1e-4), 0.001, 0.01, 0.1, 1.0]
-        lo = None
-
-        for off in lo_candidates:
-            state = _state_at_offset(classifier, base, inside_dir, off, tol)
-            if state == TopAbs_IN:
-                lo = off
-                break
-
-        if lo is None:
-            continue
-
-        # Espandi finché non riesci dal materiale
-        hi = lo * 2.0
-        hi_ok = False
-
-        while hi <= max_thickness:
-            state = _state_at_offset(classifier, base, inside_dir, hi, tol)
-
-            if state is None:
-                break
-
-            if state == TopAbs_OUT:
-                hi_ok = True
-                break
-
-            hi *= 2.0
-
-        if not hi_ok:
-            state = _state_at_offset(
-                classifier,
-                base,
-                inside_dir,
-                max_thickness,
-                tol
+            ax, ay, az = p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z()
+            bx, by, bz = p3.X() - p1.X(), p3.Y() - p1.Y(), p3.Z() - p1.Z()
+            area = 0.5 * math.sqrt(
+                (ay * bz - az * by) ** 2
+                + (az * bx - ax * bz) ** 2
+                + (ax * by - ay * bx) ** 2
             )
-            if state == TopAbs_OUT:
-                hi = max_thickness
-                hi_ok = True
+            if area <= 1e-12:
+                continue
 
-        if not hi_ok:
+            uvs = [poly.UVNode(k) for k in (n1, n2, n3)]
+            triangles.append((
+                evaluator,
+                [(uv.X(), uv.Y()) for uv in uvs],
+            ))
+            weights.append(area)
+
+    if not triangles:
+        return []
+
+    points = []
+    for idx in rng.choices(range(len(triangles)), weights=weights, k=count):
+        evaluator, (uv1, uv2, uv3) = triangles[idx]
+
+        # Punto casuale uniforme nel triangolo (coordinate baricentriche).
+        r1, r2 = rng.random(), rng.random()
+        if r1 + r2 > 1.0:
+            r1, r2 = 1.0 - r1, 1.0 - r2
+
+        u = uv1[0] + r1 * (uv2[0] - uv1[0]) + r2 * (uv3[0] - uv1[0])
+        v = uv1[1] + r1 * (uv2[1] - uv1[1]) + r2 * (uv3[1] - uv1[1])
+
+        try:
+            p, n = face_normal_at(evaluator, u, v)
+        except Exception:
             continue
 
-        # Binary search della superficie di uscita
-        a = lo
-        b = hi
-        valid = True
+        if p is not None:
+            points.append((p, n))
 
-        for _ in range(20):
-            m = (a + b) * 0.5
-            state = _state_at_offset(classifier, base, inside_dir, m, tol)
-
-            if state is None:
-                valid = False
-                break
-
-            if state == TopAbs_OUT:
-                b = m
-            else:
-                a = m
-
-        if valid and b > 1e-6 and b <= max_thickness:
-            samples.append(float(b))
-
-    return samples
+    return points
 
 
-def compute_average_thickness(
+def measure_wall_thickness(solid, max_thickness, ray_count):
+    """
+    Misura lo spessore locale di un solido con ray-casting.
+    Ritorna (lista spessori validi, numero raggi lanciati).
+    """
+    wrapped = wrap_occ(solid)
+    if wrapped is None:
+        return [], 0
+
+    try:
+        if wrapped.ShapeType() not in (TopAbs_SOLID, TopAbs_COMPSOLID):
+            return [], 0
+        vol = signed_volume(wrapped)
+    except Exception:
+        return [], 0
+
+    if abs(vol) <= 0.0:
+        return [], 0
+
+    # Solido orientato al contrario: le normali puntano verso l'interno.
+    orientation = -1.0 if vol < 0 else 1.0
+
+    diag = bbox_diagonal([solid])
+    mesh_tol = min(max(diag * 2e-3, 0.01), 1.0)
+
+    rng = random.Random(THICKNESS_RANDOM_SEED)
+    points = sample_surface_points(wrapped, ray_count, rng, mesh_tol)
+    if not points:
+        return [], 0
+
+    intersector = IntCurvesFace_ShapeIntersector()
+    intersector.Load(wrapped, 1e-6)
+    surface = make_shells_compound(wrapped)
+
+    cos_limit = math.cos(math.radians(THICKNESS_MAX_EXIT_ANGLE_DEG))
+    samples = []
+
+    for p, n in points:
+        d = (-n[0] * orientation, -n[1] * orientation, -n[2] * orientation)
+
+        try:
+            line = gp_Lin(gp_Pnt(*p), gp_Dir(*d))
+            intersector.Perform(line, THICKNESS_MIN_MM, max_thickness)
+
+            if not intersector.IsDone() or intersector.NbPnt() == 0:
+                continue
+
+            hit = min(
+                range(1, intersector.NbPnt() + 1),
+                key=intersector.WParameter,
+            )
+            dist = intersector.WParameter(hit)
+
+            _, hit_n = face_normal_at(
+                BRepGProp_Face(intersector.Face(hit)),
+                intersector.UParameter(hit),
+                intersector.VParameter(hit),
+            )
+        except Exception:
+            continue
+
+        if hit_n is None:
+            continue
+
+        # La parete d'uscita deve guardare nella stessa direzione del raggio.
+        cos_exit = orientation * (
+            hit_n[0] * d[0] + hit_n[1] * d[1] + hit_n[2] * d[2]
+        )
+        if cos_exit < cos_limit:
+            continue
+
+        # Sfera inscritta centrata a metà raggio.
+        mid = (
+            p[0] + d[0] * dist * 0.5,
+            p[1] + d[1] * dist * 0.5,
+            p[2] + d[2] * dist * 0.5,
+        )
+        try:
+            radius = distance_to_surface(mid, surface)
+        except Exception:
+            radius = None
+
+        if radius is not None and 2.0 * radius < THICKNESS_SPHERE_RATIO * dist:
+            continue
+
+        samples.append(float(dist))
+
+    return samples, len(points)
+
+
+def percentile(sorted_values, q):
+    """Percentile con interpolazione lineare (q tra 0 e 100)."""
+    if not sorted_values:
+        return 0.0
+
+    pos = (len(sorted_values) - 1) * q / 100.0
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def thickness_histogram(sorted_values):
+    """Distribuzione percentuale (sulla superficie) per classi di spessore."""
+    total = len(sorted_values)
+    if not total:
+        return []
+
+    result = []
+    edges = THICKNESS_HISTOGRAM_EDGES
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        # Tolleranza: 3.0 misurato come 2.9999999 resta nella classe 3-4.
+        cnt = sum(1 for x in sorted_values if lo <= x + 1e-6 < hi)
+        if cnt:
+            label = f">= {lo:g}" if math.isinf(hi) else f"{lo:g} - {hi:g}"
+            result.append((label, 100.0 * cnt / total))
+
+    return result
+
+
+def compute_wall_thickness(
     solids,
     fallback_volume,
     fallback_surface,
-    max_thickness=None,
+    max_thickness,
 ):
     """
-    Calcola una media spessori più robusta.
+    Statistiche di spessore del corpo.
 
     Priorità:
-    1. campionamento locale su solidi
-    2. fallback globale 2V/S
+    1. ray-casting sui solidi
+    2. fallback globale 2V/S (esatto solo per lastre sottili)
 
-    Ritorna:
-    valore, metodo, numero campioni validi
+    Ritorna un SimpleNamespace con: method, nominal (mediana), mean,
+    p2, p10, p90, p98, max, samples, rays, coverage, histogram.
+    I percentili sono sulla superficie: p98 = 98% della superficie ha
+    spessore inferiore (massimo robusto, senza i singoli raggi anomali).
     """
     samples = []
+    rays = 0
 
     if solids:
-        if max_thickness is None:
-            max_thickness = max(50.0, bbox_diagonal(solids))
+        areas = [max(safe_surface_area(s), 0.0) for s in solids]
+        total_area = sum(areas) or 1.0
 
-        per_solid = max(4, THICKNESS_MAX_SAMPLES // max(1, len(solids)))
-
-        for s in solids:
+        for s, area in zip(solids, areas):
+            # Raggi distribuiti tra i solidi in proporzione alla superficie.
+            count = max(200, int(round(THICKNESS_RAY_COUNT * area / total_area)))
             try:
-                samples.extend(
-                    measure_local_thicknesses(
-                        s,
-                        max_samples=per_solid,
-                        max_thickness=max_thickness,
-                    )
-                )
-            except Exception:
-                pass
+                s_samples, s_rays = measure_wall_thickness(s, max_thickness, count)
+            except Exception as e:
+                logger.warning(f"Misura spessore fallita su un solido: {e}")
+                continue
+
+            samples.extend(s_samples)
+            rays += s_rays
 
     if samples:
-        med = median(samples)
-
-        if med > 0:
-            # Filtro anti-outlier semplice
-            filtered = [
-                x for x in samples
-                if (0.15 * med) <= x <= (6.0 * med)
-            ]
-
-            if not filtered:
-                filtered = samples
-
-            try:
-                value = float(mean(filtered))
-            except Exception:
-                value = float(median(filtered))
-
-            return value, "local_sampled", len(filtered)
+        values = sorted(samples)
+        return SimpleNamespace(
+            method="ray_casting",
+            nominal=float(median(values)),
+            mean=float(mean(values)),
+            p2=percentile(values, 2),
+            p10=percentile(values, 10),
+            p90=percentile(values, 90),
+            p98=percentile(values, 98),
+            max=values[-1],
+            samples=len(values),
+            rays=rays,
+            coverage=len(values) / rays if rays else 0.0,
+            histogram=thickness_histogram(values),
+        )
 
     value = (2.0 * fallback_volume / fallback_surface) if fallback_surface > 0 else 0.0
-    return float(value), "global_estimate", 0
+    value = float(value)
+    return SimpleNamespace(
+        method="global_estimate_2V/S",
+        nominal=value,
+        mean=value,
+        p2=value,
+        p10=value,
+        p90=value,
+        p98=value,
+        max=value,
+        samples=0,
+        rays=rays,
+        coverage=0.0,
+        histogram=[],
+    )
 
 
 # =========================================================================
@@ -1524,10 +1738,14 @@ def analyze_shape_group(
     # Solidi originali
     original_solids = collect_solids(shapes)
 
-    # Repair multi-tolleranza
-    repaired_solids, repair_logs = try_repair_to_solids_multi(shapes)
-
     original_volume = sum(safe_volume(s) for s in original_solids)
+
+    # Repair multi-tolleranza, solo se i solidi originali non bastano
+    if original_volume > 0.0:
+        repaired_solids, repair_logs = [], ["repair non necessario"]
+    else:
+        repaired_solids, repair_logs = try_repair_to_solids_multi(shapes)
+
     repaired_volume = sum(safe_volume(s) for s in repaired_solids)
 
     # Sceglie il set migliore di solidi
@@ -1590,8 +1808,8 @@ def analyze_shape_group(
     else:
         effective_max_thickness = max(50.0, bbox_diag_value)
 
-    # Spessore medio più robusto
-    ratio_thick, thickness_method, thickness_samples_count = compute_average_thickness(
+    # Spessore pareti (ray-casting)
+    thickness = compute_wall_thickness(
         solids,
         vol,
         surf,
@@ -1629,9 +1847,7 @@ def analyze_shape_group(
         faces=faces,
         used_volume=vol,
         used_surface=surf,
-        thickness_value=ratio_thick,
-        thickness_method=thickness_method,
-        thickness_samples_count=thickness_samples_count,
+        thickness=thickness,
         cfg_max_thickness=cfg_max_thickness,
         effective_max_thickness=effective_max_thickness,
         repair_note=repair_note,
@@ -1642,7 +1858,8 @@ def analyze_shape_group(
         "B": b_value,
         "C": png_path,
         "I": float(vol),
-        "N": float(ratio_thick),
+        "N": round(thickness.nominal, 2),
+        "N_max": round(thickness.p98, 2),
         "O": bbox_str,
         "P": float(projected_area),
         "V": sliders_lifters_info,
@@ -1746,37 +1963,48 @@ def main():
 
     project = cfg_get(cfg_list[0], "project", "Default_Project") if cfg_list else "Default_Project"
     project_safe = sanitize_filename(project)
-    target_excel_path = os.path.join(BASE_DIR, f"{project_safe}.xlsx")
 
     # ---------------------------------------------------------------------
-    # Gestione progetto e file Excel
+    # Template Excel
     # ---------------------------------------------------------------------
-    os.makedirs(OUTPUT_DIR_VISTE, exist_ok=True)
-
-    if os.path.exists(PATH_TEMPLATE):
-        shutil.copy(PATH_TEMPLATE, target_excel_path)
-        logger.info(f"Template copiato in: {target_excel_path}")
-    elif not os.path.exists(target_excel_path):
-        wb_new = openpyxl.Workbook()
-        wb_new.save(target_excel_path)
-        logger.info(f"Creato nuovo file Excel: {target_excel_path}")
+    # Il form viene SEMPRE generato dal template: se manca ci si ferma,
+    # invece di produrre un foglio bianco con i dati incollati.
+    template_path = find_template_path()
+    if template_path is None:
+        logger.error(
+            f"Template non trovato in {BASE_DIR}. "
+            f"Atteso uno di: {', '.join(TEMPLATE_CANDIDATES)}"
+        )
+        return
 
     try:
-        wb = openpyxl.load_workbook(target_excel_path)
-        ws = wb.active
-
-        if ws is None:
-            ws = wb.create_sheet(project_safe[:31])
-            ws.title = project_safe[:31]
-
+        wb, out_ext = open_template(template_path)
     except Exception as e:
-        logger.error(f"Errore caricamento {target_excel_path}: {e}. Creo un nuovo file.")
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = project_safe[:31]
+        logger.error(f"Errore apertura template {template_path}: {e}")
+        traceback.print_exc()
+        return
 
-    # Data odierna in E5
-    ws["E5"] = datetime.now().strftime("%Y-%m-%d")
+    target_excel_path = os.path.join(BASE_DIR, f"{project_safe}{out_ext}")
+    if os.path.abspath(target_excel_path) == os.path.abspath(template_path):
+        target_excel_path = os.path.join(BASE_DIR, f"{project_safe}_RFQ{out_ext}")
+
+    if TEMPLATE_SHEET_NAME:
+        if TEMPLATE_SHEET_NAME not in wb.sheetnames:
+            logger.error(
+                f"Foglio '{TEMPLATE_SHEET_NAME}' non presente nel template. "
+                f"Fogli disponibili: {wb.sheetnames}"
+            )
+            return
+        ws = wb[TEMPLATE_SHEET_NAME]
+    else:
+        ws = wb.active
+
+    logger.info(f"Template: {template_path} | foglio: '{ws.title}'")
+
+    os.makedirs(OUTPUT_DIR_VISTE, exist_ok=True)
+
+    # Data odierna
+    ws[DATE_CELL] = datetime.now().strftime("%Y-%m-%d")
 
     # ---------------------------------------------------------------------
     # Ricerca file STEP
@@ -1794,7 +2022,7 @@ def main():
     logger.info(f"Avvio elaborazione: {len(step_files)} file STEP.")
 
     processed_rows = 0
-    excel_row = 3
+    excel_row = DATA_START_ROW
 
     # ---------------------------------------------------------------------
     # Elaborazione STEP
@@ -1817,9 +2045,9 @@ def main():
 
             for data in rows:
                 # Inserimento riga Excel
-                if excel_row > 3:
-                    ws.insert_rows(excel_row)
-                    copy_row_formatting(ws, 3, excel_row)
+                if excel_row > DATA_START_ROW:
+                    insert_row_keep_layout(ws, excel_row)
+                    copy_row_formatting(ws, DATA_START_ROW, excel_row)
 
                 # Dati CSV
                 for key, col in SETTINGS_COLUMN_MAP.items():
@@ -1843,6 +2071,9 @@ def main():
                     "P": "P",
                     "V": "V",
                 }
+
+                if THICKNESS_MAX_COLUMN:
+                    mapping["N_max"] = THICKNESS_MAX_COLUMN
 
                 for key, col in mapping.items():
                     ws[f"{col}{excel_row}"] = data.get(key, "")
