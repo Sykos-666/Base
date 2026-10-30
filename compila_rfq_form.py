@@ -6,7 +6,9 @@ Matching su colonna 'cad_filename' in settings.csv.
 
 Funzionalità:
 - analisi geometrica robusta
-- volume, area proiettata, bounding box
+- volume, bounding box
+- direzione di apertura stampo (analisi sottosquadri) e area proiettata
+  come unione esatta delle proiezioni (shapely)
 - diagnosi volume zero
 - repair automatico shell/solidi
 - repair con tolleranze multiple
@@ -31,6 +33,8 @@ from statistics import mean, median
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.worksheet.cell_range import CellRange
+from openpyxl.formula.translate import Translator
+from openpyxl.utils import get_column_letter
 
 import cadquery as cq
 
@@ -55,6 +59,7 @@ from OCP.TopoDS import TopoDS_Compound
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.BRepTools import BRepTools
 from OCP.TopLoc import TopLoc_Location
 from OCP.IntCurvesFace import IntCurvesFace_ShapeIntersector
 from OCP.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Lin
@@ -128,8 +133,12 @@ TEMPLATE_CANDIDATES = [
 # Nome del foglio del form. None = foglio attivo del template.
 TEMPLATE_SHEET_NAME = None
 
-# Prima riga dati del form e cella della data.
+# Prima riga dati del form, colonna numero progressivo e cella della data.
+# La riga dati del template (formule, "please fill", stili) viene
+# replicata per ogni pezzo; le formule di totale sotto (es. SUM(AQ3:AQ3))
+# vengono estese a tutte le righe inserite.
 DATA_START_ROW = 3
+ITEM_NO_COLUMN = "A"
 DATE_CELL = "E5"
 
 # Colonna Excel per lo spessore massimo (es. "M"). None = non scritto.
@@ -640,83 +649,6 @@ def bbox_diagonal(shapes):
 
 
 # =========================================================================
-# LOGICA GEOMETRIA AVANZATA
-# =========================================================================
-def determine_best_parting_axis(faces):
-    """
-    Determina l'asse di sformo ottimale analizzando i sottosquadri.
-    Ritorna:
-    ((vx, vy, vz), nome_asse), min_undercuts
-    """
-    axes = [
-        ((0.0, 0.0, 1.0), "<Z or >Z"),
-        ((1.0, 0.0, 0.0), "<X or >X"),
-        ((0.0, 1.0, 0.0), "<Y or >Y"),
-    ]
-
-    if not faces:
-        return axes[0], 0
-
-    best_axis = axes[0]
-    min_undercuts = float("inf")
-
-    for ax_vector, ax_name in axes:
-        undercut_count = 0
-
-        for f in faces:
-            try:
-                fn = f.normalAt()
-                dot = abs(
-                    fn.x * ax_vector[0]
-                    + fn.y * ax_vector[1]
-                    + fn.z * ax_vector[2]
-                )
-
-                # Faccia quasi parallela alla direzione considerata
-                if dot < 0.01:
-                    undercut_count += 1
-            except Exception:
-                continue
-
-        if undercut_count < min_undercuts:
-            min_undercuts = undercut_count
-            best_axis = (ax_vector, ax_name)
-
-    if min_undercuts == float("inf"):
-        return axes[0], 0
-
-    return best_axis, min_undercuts
-
-
-def calculate_projected_area_accurate(faces, direction):
-    """
-    Calcola l'area proiettata sommando il contributo delle facce visibili
-    rispetto alla direzione di sformo.
-    """
-    if not faces:
-        return 0.0
-
-    projected_area = 0.0
-
-    for f in faces:
-        try:
-            fn = f.normalAt()
-            cos_angle = (
-                fn.x * direction[0]
-                + fn.y * direction[1]
-                + fn.z * direction[2]
-            )
-
-            if cos_angle > 0:
-                face_area = safe_face_area(f)
-                projected_area += face_area * abs(cos_angle)
-        except Exception:
-            continue
-
-    return projected_area
-
-
-# =========================================================================
 # MATCHING CSV
 # =========================================================================
 def find_cfg_for_step(step_path, cfg_list):
@@ -771,19 +703,86 @@ def find_cfg_for_step(step_path, cfg_list):
 # =========================================================================
 # EXCEL
 # =========================================================================
-def copy_row_formatting(source_ws, source_row, target_row):
-    """Copia la formattazione da una riga sorgente a una riga destinazione."""
-    for col in range(1, source_ws.max_column + 1):
-        source_cell = source_ws.cell(row=source_row, column=col)
-        target_cell = source_ws.cell(row=target_row, column=col)
+def snapshot_row(ws, row):
+    """Valori e stili di una riga del template, prima di sovrascriverla."""
+    result = []
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=row, column=col)
+        result.append((col, cell.value, copy.copy(cell._style)))
+    return result
 
-        if source_cell.has_style:
-            target_cell.font = copy.copy(source_cell.font)
-            target_cell.border = copy.copy(source_cell.border)
-            target_cell.fill = copy.copy(source_cell.fill)
-            target_cell.number_format = copy.copy(source_cell.number_format)
-            target_cell.protection = copy.copy(source_cell.protection)
-            target_cell.alignment = copy.copy(source_cell.alignment)
+
+def fill_row_from_template(ws, snapshot, src_row, dst_row):
+    """
+    Riproduce la riga dati del template su dst_row: stili, segnaposto
+    ('please fill') e formule riferite alla nuova riga
+    (es. =SUM(I3:J3)/1000*K3 -> =SUM(I5:J5)/1000*K5).
+    """
+    for col, value, style in snapshot:
+        cell = ws.cell(row=dst_row, column=col)
+        cell._style = copy.copy(style)
+
+        if isinstance(value, str) and value.startswith("="):
+            letter = get_column_letter(col)
+            value = Translator(value, origin=f"{letter}{src_row}").translate_formula(
+                f"{letter}{dst_row}"
+            )
+
+        cell.value = value
+
+
+def extend_total_formulas(ws, first_row, last_row):
+    """
+    Estende alle righe inserite gli intervalli delle formule sotto la tabella
+    che coprivano solo la riga dati del template: SUM(AQ3:AQ3) -> SUM(AQ3:AQ7).
+    """
+    if last_row <= first_row:
+        return
+
+    pattern = re.compile(
+        r"(?<![A-Za-z$])(\$?[A-Z]{1,3}\$?)%d:(\$?[A-Z]{1,3}\$?)%d(?!\d)"
+        % (first_row, first_row)
+    )
+
+    for row in ws.iter_rows(min_row=last_row + 1):
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.value = pattern.sub(
+                    lambda m: f"{m.group(1)}{first_row}:{m.group(2)}{last_row}",
+                    cell.value,
+                )
+
+
+def excel_value(value):
+    """
+    Converte i testi numerici del CSV in numeri, così le formule del
+    template (es. peso = volume * densità) non danno #VALORE!.
+    '1,05' / '1.05' -> 1.05; '100.000' (separatore migliaia) -> 100000.
+    """
+    if not isinstance(value, str):
+        return value
+
+    txt = value.strip()
+    if re.fullmatch(r"-?\d{1,3}(\.\d{3})+", txt):
+        return int(txt.replace(".", ""))
+    if re.fullmatch(r"-?\d+", txt):
+        return int(txt)
+    if re.fullmatch(r"-?\d+[.,]\d+", txt):
+        return float(txt.replace(",", "."))
+    return value
+
+
+def fit_image_in_cell(img, ws, col_letter, row):
+    """Ridimensiona l'immagine nella cella mantenendo le proporzioni."""
+    col_width = ws.column_dimensions[col_letter].width or 8.43
+    row_height = ws.row_dimensions[row].height or 15.0
+
+    box_w = col_width * 7.0 + 5.0 - 6.0      # pixel, con un piccolo margine
+    box_h = row_height * 96.0 / 72.0 - 6.0
+
+    scale = min(box_w / img.width, box_h / img.height)
+    img.width = max(1, int(img.width * scale))
+    img.height = max(1, int(img.height * scale))
 
 
 def insert_row_keep_layout(ws, row_idx):
@@ -815,6 +814,15 @@ def insert_row_keep_layout(ws, row_idx):
     for r in sorted(heights, reverse=True):
         ws.row_dimensions[r + 1].height = heights[r]
     ws.row_dimensions[row_idx].height = ws.row_dimensions[row_idx - 1].height
+
+    # Immagini del template ancorate sotto la riga inserita (es. logo/note).
+    for img in getattr(ws, "_images", []):
+        anchor = img.anchor
+        if isinstance(anchor, str):
+            continue
+        for marker in (getattr(anchor, "_from", None), getattr(anchor, "to", None)):
+            if marker is not None and marker.row >= row_idx - 1:
+                marker.row += 1
 
 
 def find_template_path():
@@ -878,6 +886,7 @@ def log_geometry_report(
     used_volume,
     used_surface,
     thickness,
+    parting,
     cfg_max_thickness,
     effective_max_thickness,
     repair_note,
@@ -929,6 +938,20 @@ def log_geometry_report(
         for label, pct in thickness.histogram:
             lines.append(f"  {label:>16} mm: {pct:5.1f}%")
     lines.append(f"Max spessore da CSV: {cfg_max_thickness}")
+    lines.append(
+        f"Direzione apertura stampo: {parting.direction} ({parting.source})"
+    )
+    lines.append(
+        f"Area proiettata: {parting.projected_area:.2f} mm2 "
+        f"(contorno esterno, fori inclusi: {parting.contour_area:.2f} mm2) "
+        f"| metodo: {parting.method}"
+    )
+    for c in parting.candidates:
+        uc = "n.d." if c.undercut_pct is None else f"{c.undercut_pct:5.1f}%"
+        lines.append(
+            f"  {c.name:<40} area proiettata {c.projected_area:12.2f} mm2 "
+            f"| sottosquadri {uc} superficie"
+        )
     lines.append(f"Max spessore effettivo: {effective_max_thickness}")
     lines.append(f"Nota repair: {repair_note}")
 
@@ -1622,6 +1645,342 @@ def compute_wall_thickness(
 
 
 # =========================================================================
+# DIREZIONE DI SFORMO E AREA PROIETTATA
+# =========================================================================
+#
+# Area proiettata = area dell'"ombra" del pezzo su un piano perpendicolare
+# alla direzione di apertura dello stampo: è l'area su cui agisce la
+# pressione in cavità, quindi determina la forza di chiusura.
+#
+# Calcolo: i triangoli della mesh rivolti verso la direzione di apertura
+# vengono proiettati sul piano e se ne fa l'UNIONE geometrica (shapely).
+# Le zone sovrapposte (es. fondo e bordo di una scatola, nervature sopra
+# il fondo) contano una sola volta e i fori passanti restano esclusi.
+# Senza shapely si usa una griglia di raggi paralleli alla direzione
+# (più lenta e approssimata sul contorno).
+#
+# Direzione di apertura: per ogni direzione candidata (X, Y, Z e assi
+# principali d'inerzia) da punti campionati sulla superficie si lancia un
+# raggio nel verso in cui quel punto si sforma (+d o -d secondo la
+# normale). Se il raggio colpisce di nuovo il pezzo, il punto è in
+# sottosquadro. Vince la direzione con meno area in sottosquadro; a pari
+# merito (es. una lastra, sformabile in tutte e tre le direzioni) quella
+# con area proiettata maggiore, cioè il pezzo "steso" nello stampo.
+# La direzione si può forzare dal CSV con la colonna 'parting_direction'
+# (valori X, Y o Z).
+
+try:
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+except Exception:
+    Polygon = None
+    unary_union = None
+
+# Punti campionati per l'analisi sottosquadri (per direzione).
+PARTING_RAY_COUNT = 2000
+# Facce entro questo angolo dalla direzione di apertura sono pareti
+# parallele all'apertura (senza sformo), non sottosquadri.
+PARTING_NEUTRAL_DEG = 0.5
+# Differenza di area in sottosquadro (frazione della superficie) entro cui
+# due direzioni sono considerate equivalenti.
+PARTING_TIE_REL = 0.005
+# Deflessione mesh relativa alla diagonale bbox, limitata a [0.005, 0.05] mm.
+PROJECTION_MESH_TOL_REL = 2e-4
+# Risoluzione della griglia di raggi usata se shapely non è installato.
+PROJECTION_GRID_SIZE = 150
+
+AXIS_DIRECTIONS = {
+    "X": (1.0, 0.0, 0.0),
+    "Y": (0.0, 1.0, 0.0),
+    "Z": (0.0, 0.0, 1.0),
+}
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def plane_basis(d):
+    """Due versori ortogonali tra loro e alla direzione d."""
+    helper = (1.0, 0.0, 0.0) if abs(d[0]) < 0.9 else (0.0, 1.0, 0.0)
+    u = _vec_norm(*_cross(d, helper))
+    v = _cross(d, u)
+    return u, v
+
+
+def parse_parting_direction(cfg):
+    """Direzione di apertura forzata dal CSV ('X', '>Z', '-y', ...), o None."""
+    for key in ("parting_direction", "opening_direction", "draw_direction"):
+        txt = str(cfg_get(cfg, key, "")).strip().upper()
+        letters = [ch for ch in txt if ch in AXIS_DIRECTIONS]
+        if letters:
+            return letters[0]
+    return None
+
+
+def candidate_directions(solids):
+    """Assi X, Y, Z più gli assi principali d'inerzia non già inclusi."""
+    cands = list(AXIS_DIRECTIONS.items())
+
+    try:
+        props = gprop_call(
+            "VolumeProperties", wrap_occ(combine_shapes(solids)), GProp_GProps()
+        )
+        pp = props.PrincipalProperties()
+        axes = [
+            pp.FirstAxisOfInertia(),
+            pp.SecondAxisOfInertia(),
+            pp.ThirdAxisOfInertia(),
+        ]
+    except Exception:
+        axes = []
+
+    for i, ax in enumerate(axes, start=1):
+        vec = _vec_norm(ax.X(), ax.Y(), ax.Z())
+        if vec is None:
+            continue
+        if any(abs(_dot(vec, c)) > 0.999 for _, c in cands):
+            continue
+        name = f"inerzia {i} ({vec[0]:+.2f}, {vec[1]:+.2f}, {vec[2]:+.2f})"
+        cands.append((name, vec))
+
+    return cands
+
+
+def shape_triangles(shape, mesh_tol, outward):
+    """
+    Triangoli della mesh in coordinate globali.
+    Con outward=True la normale (p2-p1)x(p3-p1) punta fuori dal solido.
+    """
+    # Elimina la mesh esistente (es. quella grossolana del calcolo spessori),
+    # altrimenti tessellate() la riusa invece di rifarla alla tolleranza data.
+    BRepTools.Clean_s(wrap_occ(shape))
+    verts, tris = shape.tessellate(mesh_tol, 0.1)
+    pts = [(p.x, p.y, p.z) for p in verts]
+
+    flip = False
+    if outward:
+        try:
+            flip = signed_volume(wrap_occ(shape)) < 0
+        except Exception:
+            pass
+
+    result = []
+    for a, b, c in tris:
+        if flip:
+            b, c = c, b
+        result.append((pts[a], pts[b], pts[c]))
+    return result
+
+
+def silhouette_area_polygons(triangles, d, front_only):
+    """
+    Area esatta (a meno della mesh) della proiezione lungo d.
+    Ritorna (area netta, area contorno esterno con i fori riempiti).
+    """
+    u, v = plane_basis(d)
+    polys = []
+
+    for p1, p2, p3 in triangles:
+        if front_only and _dot(_cross(_sub(p2, p1), _sub(p3, p1)), d) <= 0.0:
+            continue
+
+        poly = Polygon([(_dot(p, u), _dot(p, v)) for p in (p1, p2, p3)])
+        if poly.area > 1e-9:
+            polys.append(poly)
+
+    if not polys:
+        return 0.0, 0.0
+
+    union = unary_union(polys).buffer(0)
+    parts = getattr(union, "geoms", [union])
+    contour = sum(Polygon(g.exterior).area for g in parts if hasattr(g, "exterior"))
+    return float(union.area), float(contour)
+
+
+def silhouette_area_grid(shape_occ, intersector, d):
+    """
+    Area della proiezione lungo d contando quanti raggi paralleli a d,
+    su una griglia regolare, colpiscono il pezzo (fallback senza shapely).
+    """
+    bb = safe_bounding_box([shape_occ])
+    if bb is None:
+        return 0.0, 0.0
+
+    u, v = plane_basis(d)
+    corners = [
+        (x, y, z)
+        for x in (bb.xmin, bb.xmax)
+        for y in (bb.ymin, bb.ymax)
+        for z in (bb.zmin, bb.zmax)
+    ]
+    us = [_dot(c, u) for c in corners]
+    vs = [_dot(c, v) for c in corners]
+    ws_ = [_dot(c, d) for c in corners]
+
+    n = PROJECTION_GRID_SIZE
+    du = (max(us) - min(us)) / n
+    dv = (max(vs) - min(vs)) / n
+    w0 = min(ws_) - 1.0
+    length = max(ws_) - w0 + 1.0
+
+    hits = 0
+    for i in range(n):
+        a = min(us) + (i + 0.5) * du
+        for j in range(n):
+            b = min(vs) + (j + 0.5) * dv
+            origin = tuple(a * u[k] + b * v[k] + w0 * d[k] for k in range(3))
+            intersector.Perform(gp_Lin(gp_Pnt(*origin), gp_Dir(*d)), 0.0, length)
+            if intersector.IsDone() and intersector.NbPnt() > 0:
+                hits += 1
+
+    area = hits * du * dv
+    return float(area), float(area)
+
+
+def undercut_fraction(points, intersector, d, max_len):
+    """
+    Frazione di superficie in sottosquadro per apertura lungo ±d.
+    points: lista di (punto, normale uscente), ognuno della stessa area.
+    """
+    if not points:
+        return 0.0
+
+    sin_neutral = math.sin(math.radians(PARTING_NEUTRAL_DEG))
+    neg_d = (-d[0], -d[1], -d[2])
+    blocked = 0
+
+    for p, n in points:
+        c = _dot(n, d)
+        if abs(c) < sin_neutral:
+            continue
+
+        pull = d if c > 0 else neg_d
+        try:
+            intersector.Perform(
+                gp_Lin(gp_Pnt(*p), gp_Dir(*pull)), THICKNESS_MIN_MM, max_len
+            )
+        except Exception:
+            continue
+
+        if intersector.IsDone() and intersector.NbPnt() > 0:
+            blocked += 1
+
+    return blocked / len(points)
+
+
+def analyze_parting_and_projection(solids, shapes, cfg):
+    """
+    Sceglie la direzione di apertura e calcola l'area proiettata.
+
+    Ritorna un SimpleNamespace con: direction (nome), source (auto/CSV),
+    projected_area, contour_area, method, candidates (lista per direzione
+    con name, undercut_pct, projected_area, contour_area).
+    """
+    body_shapes = solids if solids else shapes
+    combined = combine_shapes(body_shapes)
+    combined_occ = wrap_occ(combined)
+
+    diag = bbox_diagonal(body_shapes)
+    mesh_tol = min(max(diag * PROJECTION_MESH_TOL_REL, 0.005), 0.05)
+
+    intersector = IntCurvesFace_ShapeIntersector()
+    intersector.Load(combined_occ, 1e-6)
+
+    use_polygons = Polygon is not None
+    if use_polygons:
+        method = "unione poligoni (shapely)"
+        triangles = []
+        for s in body_shapes:
+            triangles.extend(shape_triangles(s, mesh_tol, outward=bool(solids)))
+    else:
+        method = f"griglia raggi {PROJECTION_GRID_SIZE}x{PROJECTION_GRID_SIZE}"
+        logger.warning(
+            "shapely non installato: area proiettata con griglia di raggi "
+            "(più lenta e meno precisa). Installare con: pip install shapely"
+        )
+
+    def projection(d):
+        if use_polygons:
+            # Senza solidi l'orientamento non è affidabile: si proiettano
+            # tutti i triangoli (l'unione dà comunque la sagoma).
+            return silhouette_area_polygons(triangles, d, front_only=bool(solids))
+        return silhouette_area_grid(combined_occ, intersector, d)
+
+    # Punti per l'analisi sottosquadri, con normale uscente.
+    points = []
+    if solids:
+        areas = [max(safe_surface_area(s), 0.0) for s in solids]
+        total = sum(areas) or 1.0
+        rng = random.Random(THICKNESS_RANDOM_SEED)
+
+        for s, area in zip(solids, areas):
+            w = wrap_occ(s)
+            try:
+                sign = -1.0 if signed_volume(w) < 0 else 1.0
+            except Exception:
+                continue
+
+            count = max(200, int(round(PARTING_RAY_COUNT * area / total)))
+            for p, n in sample_surface_points(w, count, rng, mesh_tol):
+                points.append((p, (n[0] * sign, n[1] * sign, n[2] * sign)))
+
+    forced = parse_parting_direction(cfg)
+    cands = (
+        [(forced, AXIS_DIRECTIONS[forced])] if forced
+        else candidate_directions(solids) if solids
+        else list(AXIS_DIRECTIONS.items())
+    )
+
+    results = []
+    for name, d in cands:
+        proj, contour = projection(d)
+        uc = undercut_fraction(points, intersector, d, 2.0 * diag + 1.0) if points else None
+        results.append(SimpleNamespace(
+            name=name,
+            undercut_pct=None if uc is None else 100.0 * uc,
+            projected_area=proj,
+            contour_area=contour,
+        ))
+
+    if forced:
+        best = results[0]
+        source = "da CSV"
+    elif points:
+        best_uc = min(r.undercut_pct for r in results)
+        tie = [
+            r for r in results
+            if r.undercut_pct <= best_uc + 100.0 * PARTING_TIE_REL
+        ]
+        best = max(tie, key=lambda r: r.projected_area)
+        source = "automatica (sottosquadri minimi)"
+    else:
+        best = max(results, key=lambda r: r.projected_area)
+        source = "automatica (nessun solido: area massima)"
+
+    return SimpleNamespace(
+        direction=best.name,
+        source=source,
+        projected_area=best.projected_area,
+        contour_area=best.contour_area,
+        method=method,
+        candidates=results,
+    )
+
+
+# =========================================================================
 # EXPORT IMMAGINI
 # =========================================================================
 def export_iso_image(shapes, safe_name, imported=None):
@@ -1817,8 +2176,7 @@ def analyze_shape_group(
     )
 
     # Asse di sformo e area proiettata
-    (best_axis_vector, axis_name), min_undercuts = determine_best_parting_axis(faces)
-    projected_area = calculate_projected_area_accurate(faces, best_axis_vector)
+    parting = analyze_parting_and_projection(solids, shapes, cfg)
 
     # Valore cella B
     part_name = str(cfg_get(cfg, "part_name", "")).strip()
@@ -1848,6 +2206,7 @@ def analyze_shape_group(
         used_volume=vol,
         used_surface=surf,
         thickness=thickness,
+        parting=parting,
         cfg_max_thickness=cfg_max_thickness,
         effective_max_thickness=effective_max_thickness,
         repair_note=repair_note,
@@ -1861,7 +2220,7 @@ def analyze_shape_group(
         "N": round(thickness.nominal, 2),
         "N_max": round(thickness.p98, 2),
         "O": bbox_str,
-        "P": float(projected_area),
+        "P": round(parting.projected_area, 2),
         "V": sliders_lifters_info,
     }
 
@@ -2006,6 +2365,9 @@ def main():
     # Data odierna
     ws[DATE_CELL] = datetime.now().strftime("%Y-%m-%d")
 
+    # Riga dati del template, da replicare per ogni pezzo.
+    template_row = snapshot_row(ws, DATA_START_ROW)
+
     # ---------------------------------------------------------------------
     # Ricerca file STEP
     # ---------------------------------------------------------------------
@@ -2047,13 +2409,16 @@ def main():
                 # Inserimento riga Excel
                 if excel_row > DATA_START_ROW:
                     insert_row_keep_layout(ws, excel_row)
-                    copy_row_formatting(ws, DATA_START_ROW, excel_row)
+                    fill_row_from_template(ws, template_row, DATA_START_ROW, excel_row)
 
-                # Dati CSV
+                if ITEM_NO_COLUMN:
+                    ws[f"{ITEM_NO_COLUMN}{excel_row}"] = processed_rows + 1
+
+                # Dati CSV (se vuoti resta il segnaposto del template)
                 for key, col in SETTINGS_COLUMN_MAP.items():
-                    cell_ref = f"{col}{excel_row}"
                     val = cfg_get(cfg, key, "")
-                    ws[cell_ref] = val
+                    if str(val).strip():
+                        ws[f"{col}{excel_row}"] = excel_value(val)
 
                 # Logica Cell Z: Valutazione pressa (tonnellaggio)
                 press_text = str(cfg_get(cfg, "press", ""))
@@ -2076,7 +2441,9 @@ def main():
                     mapping["N_max"] = THICKNESS_MAX_COLUMN
 
                 for key, col in mapping.items():
-                    ws[f"{col}{excel_row}"] = data.get(key, "")
+                    val = data.get(key, "")
+                    if val is not None and str(val).strip():
+                        ws[f"{col}{excel_row}"] = val
 
                 # Immagine in colonna C
                 img_path = data.get("C")
@@ -2084,10 +2451,8 @@ def main():
                 if img_path and os.path.exists(img_path):
                     try:
                         img = XLImage(img_path)
-                        img.width = 100
-                        img.height = 75
+                        fit_image_in_cell(img, ws, "C", excel_row)
                         ws.add_image(img, f"C{excel_row}")
-                        ws.row_dimensions[excel_row].height = 60
                     except Exception as img_exc:
                         logger.warning(f"Errore inserimento immagine: {img_exc}")
 
@@ -2105,6 +2470,9 @@ def main():
             logger.error(f"Errore su {step_file}: {e}")
             traceback.print_exc()
             continue
+
+    # Totali sotto la tabella estesi a tutte le righe inserite
+    extend_total_formulas(ws, DATA_START_ROW, excel_row - 1)
 
     # ---------------------------------------------------------------------
     # Pulizia SVG residui
