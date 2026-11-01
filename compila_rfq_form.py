@@ -14,7 +14,7 @@ Funzionalità:
 - repair con tolleranze multiple
 - spessore pareti con ray-casting (nominale, medio, massimo)
 - soglia massima spessore da CSV
-- log su file in output\ (in console solo il riepilogo finale)
+- log su file in output/ (in console solo il riepilogo finale)
 - analisi separata per singolo corpo se assembly/multibody
 """
 
