@@ -14,15 +14,17 @@ Funzionalità:
 - repair con tolleranze multiple
 - spessore pareti con ray-casting (nominale, medio, massimo)
 - soglia massima spessore da CSV
-- log su file
+- log su file in output\ (in console solo il riepilogo finale)
 - analisi separata per singolo corpo se assembly/multibody
 """
 
 import os
 import re
+import sys
+import contextlib
+import tempfile
 import copy
 import csv
-import traceback
 import math
 import random
 import logging
@@ -78,7 +80,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PATH_SETTINGS = os.path.join(BASE_DIR, "settings.csv")
 PATH_INPUT = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR_VISTE = os.path.join(BASE_DIR, "viste")
-LOG_FILE = os.path.join(BASE_DIR, "analisi.log")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+LOG_FILE = os.path.join(OUTPUT_DIR, "analisi.log")
 
 
 # =========================================================================
@@ -141,6 +144,17 @@ DATA_START_ROW = 3
 ITEM_NO_COLUMN = "A"
 DATE_CELL = "E5"
 
+# Colonne del CSV da scrivere come numeri (chiavi normalizzate, senza
+# spazi/underscore). "decimal" accetta la virgola come separatore decimale.
+CSV_NUMERIC_KEYS = {
+    "density": "decimal",
+    "cycletime": "decimal",
+    "demandaverageyearlyvolume": "integer",
+    "cavities": "integer",
+    "dropnumber": "integer",
+    "moldlifetime": "integer",
+}
+
 # Colonna Excel per lo spessore massimo (es. "M"). None = non scritto.
 THICKNESS_MAX_COLUMN = None
 
@@ -148,22 +162,82 @@ THICKNESS_MAX_COLUMN = None
 # =========================================================================
 # LOGGING
 # =========================================================================
+# Tutti i messaggi (report geometrici, avvisi, errori con traceback,
+# warning Python delle librerie) vanno nel file di log in output\.
+# In console compare solo il riepilogo finale.
 logger = logging.getLogger("analisi_rfq")
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
-if not logger.handlers:
+
+def fatal(message):
+    """Errore che blocca l'esecuzione: nel log e, in breve, in console."""
+    logger.error(message)
+    print(f"ERRORE: {message}")
+    print(f"Dettagli nel log: {LOG_FILE}")
+
+
+@contextlib.contextmanager
+def capture_native_output():
+    """
+    Cattura i messaggi che OpenCASCADE (codice C++) scrive direttamente
+    su stdout/stderr, ad es. errori di lettura STEP, e li scrive nel log
+    invece che in console.
+    """
+    saved = []
+    tmp = None
+
+    try:
+        tmp = tempfile.TemporaryFile()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for fd in (1, 2):
+            saved.append((fd, os.dup(fd)))
+            os.dup2(tmp.fileno(), fd)
+    except Exception:
+        # Console non standard (es. alcuni IDE): nessuna cattura.
+        for fd, copy_fd in saved:
+            os.dup2(copy_fd, fd)
+            os.close(copy_fd)
+        saved = []
+
+    try:
+        yield
+    finally:
+        if saved:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for fd, copy_fd in saved:
+                os.dup2(copy_fd, fd)
+                os.close(copy_fd)
+
+        if tmp is not None:
+            try:
+                tmp.seek(0)
+                text = tmp.read().decode("utf-8", "replace")
+                text = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
+                if text:
+                    logger.warning(f"Messaggi OpenCASCADE:\n{text}")
+            finally:
+                tmp.close()
+
+
+def setup_logging():
+    """Configura il log su file in OUTPUT_DIR."""
+    if logger.handlers:
+        return
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
-    console_handler = logging.StreamHandler()
-
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s"
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     )
-
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+
+    # Warning Python (es. openpyxl) nel log invece che in console.
+    logging.captureWarnings(True)
+    logging.getLogger("py.warnings").addHandler(file_handler)
 
 
 # =========================================================================
@@ -753,23 +827,63 @@ def extend_total_formulas(ws, first_row, last_row):
                 )
 
 
-def excel_value(value):
+def parse_csv_number(value, kind):
     """
-    Converte i testi numerici del CSV in numeri, così le formule del
-    template (es. peso = volume * densità) non danno #VALORE!.
-    '1,05' / '1.05' -> 1.05; '100.000' (separatore migliaia) -> 100000.
+    Converte un testo numerico del CSV in numero.
+
+    kind = "decimal": '1,05', '1.05', '1,05 g/cm3' -> 1.05;
+                      '1.234,5' / '1,234.5' -> 1234.5
+                      (con entrambi i separatori, l'ultimo è il decimale).
+    kind = "integer": '100.000', '100,000', '100 000 pz' -> 100000.
+
+    Ritorna None se il testo non contiene un numero.
     """
-    if not isinstance(value, str):
+    if isinstance(value, (int, float)):
         return value
 
-    txt = value.strip()
-    if re.fullmatch(r"-?\d{1,3}(\.\d{3})+", txt):
-        return int(txt.replace(".", ""))
-    if re.fullmatch(r"-?\d+", txt):
-        return int(txt)
-    if re.fullmatch(r"-?\d+[.,]\d+", txt):
-        return float(txt.replace(",", "."))
-    return value
+    m = re.search(r"-?\d[\d.,\s]*", str(value or ""))
+    if not m:
+        return None
+
+    txt = re.sub(r"\s+", "", m.group(0)).rstrip(".,")
+
+    if kind == "integer":
+        digits = re.sub(r"[.,]", "", txt)
+        return int(digits) if digits.lstrip("-").isdigit() else None
+
+    if "," in txt and "." in txt:
+        dec = "," if txt.rfind(",") > txt.rfind(".") else "."
+        thousands = "." if dec == "," else ","
+        txt = txt.replace(thousands, "").replace(dec, ".")
+    else:
+        txt = txt.replace(",", ".")
+
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
+def excel_value(key, value):
+    """
+    Valore da scrivere nel form per una colonna del CSV.
+
+    Le colonne in CSV_NUMERIC_KEYS vengono scritte come NUMERI, non come
+    testo, perché usate nelle formule del template (es. peso L = I/1000*K
+    con K = densità). Nel file .xlsx il numero è salvato senza separatore:
+    Excel in italiano lo mostra con la virgola (1,05) secondo il formato
+    della cella. Un testo "1,05" invece darebbe #VALORE! nelle formule.
+    """
+    kind = CSV_NUMERIC_KEYS.get(normalize_key(key))
+    if kind is None:
+        return value
+
+    number = parse_csv_number(value, kind)
+    if number is None:
+        logger.warning(f"Valore non numerico per '{key}': '{value}' (scritto come testo)")
+        return value
+
+    return number
 
 
 def fit_image_in_cell(img, ws, col_letter, row):
@@ -785,12 +899,16 @@ def fit_image_in_cell(img, ws, col_letter, row):
     img.height = max(1, int(img.height * scale))
 
 
-def insert_row_keep_layout(ws, row_idx):
+def insert_rows_keep_layout(ws, row_idx, amount):
     """
-    Inserisce una riga come ws.insert_rows(), ma sposta anche celle unite
-    e altezze righe sottostanti: openpyxl non lo fa, e senza questo il
-    layout del template (intestazioni, note, piè di pagina) si rompe.
+    Inserisce 'amount' righe prima di row_idx come ws.insert_rows(), ma
+    sposta anche celle unite, altezze righe e immagini sottostanti:
+    openpyxl non lo fa, e senza questo il layout del template
+    (intestazioni, note, logo) si rompe.
     """
+    if amount <= 0:
+        return
+
     merged_below = [
         str(rng) for rng in ws.merged_cells.ranges
         if rng.min_row >= row_idx
@@ -804,25 +922,53 @@ def insert_row_keep_layout(ws, row_idx):
         if r >= row_idx and dim.height is not None
     }
 
-    ws.insert_rows(row_idx)
+    ws.insert_rows(row_idx, amount)
 
     for ref in merged_below:
         rng = CellRange(ref)
-        rng.shift(row_shift=1)
+        rng.shift(row_shift=amount)
         ws.merge_cells(rng.coord)
 
-    for r in sorted(heights, reverse=True):
-        ws.row_dimensions[r + 1].height = heights[r]
-    ws.row_dimensions[row_idx].height = ws.row_dimensions[row_idx - 1].height
+    for r in heights:
+        ws.row_dimensions[r].height = None
+    for r, h in heights.items():
+        ws.row_dimensions[r + amount].height = h
 
-    # Immagini del template ancorate sotto la riga inserita (es. logo/note).
+    # Le nuove righe prendono l'altezza della riga sopra (riga dati template).
+    for r in range(row_idx, row_idx + amount):
+        ws.row_dimensions[r].height = ws.row_dimensions[row_idx - 1].height
+
+    # Immagini del template ancorate sotto le righe inserite.
     for img in getattr(ws, "_images", []):
         anchor = img.anchor
         if isinstance(anchor, str):
             continue
         for marker in (getattr(anchor, "_from", None), getattr(anchor, "to", None)):
             if marker is not None and marker.row >= row_idx - 1:
-                marker.row += 1
+                marker.row += amount
+
+
+def prepare_data_rows(ws, count):
+    """
+    Prepara il form per 'count' pezzi in un'unica operazione:
+    - inserisce subito count-1 righe sotto la riga dati del template;
+    - le riempie con stili, segnaposto e formule della riga del template;
+    - corregge le formule di totale sotto la tabella (riga 4 del template)
+      perché coprano tutte le righe.
+    """
+    if count <= 1:
+        return
+
+    first = DATA_START_ROW
+    last = DATA_START_ROW + count - 1
+
+    template_row = snapshot_row(ws, first)
+    insert_rows_keep_layout(ws, first + 1, count - 1)
+
+    for row in range(first + 1, last + 1):
+        fill_row_from_template(ws, template_row, first, row)
+
+    extend_total_formulas(ws, first, last)
 
 
 def find_template_path():
@@ -2286,8 +2432,17 @@ def main():
     cfg_list = []
 
     if os.path.exists(PATH_SETTINGS):
-        with open(PATH_SETTINGS, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
+        with open(PATH_SETTINGS, "r", encoding="utf-8-sig", newline="") as f:
+            # Excel in italiano salva i CSV con ';' (la virgola è il
+            # separatore decimale): si riconosce il delimitatore.
+            sample = f.read(4096)
+            f.seek(0)
+            try:
+                delimiter = csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
+            except csv.Error:
+                delimiter = ";" if sample.count(";") > sample.count(",") else ","
+
+            reader = csv.DictReader(f, delimiter=delimiter)
 
             for row in reader:
                 # Salta righe completamente vuote
@@ -2315,7 +2470,10 @@ def main():
                 if cleaned_row:
                     cfg_list.append(cleaned_row)
 
-        logger.info(f"Caricati {len(cfg_list)} record da settings.csv")
+        logger.info(
+            f"Caricati {len(cfg_list)} record da settings.csv "
+            f"(delimitatore '{delimiter}')"
+        )
     else:
         logger.warning("Attenzione: settings.csv non trovato.")
         cfg_list = []
@@ -2330,7 +2488,7 @@ def main():
     # invece di produrre un foglio bianco con i dati incollati.
     template_path = find_template_path()
     if template_path is None:
-        logger.error(
+        fatal(
             f"Template non trovato in {BASE_DIR}. "
             f"Atteso uno di: {', '.join(TEMPLATE_CANDIDATES)}"
         )
@@ -2339,8 +2497,8 @@ def main():
     try:
         wb, out_ext = open_template(template_path)
     except Exception as e:
-        logger.error(f"Errore apertura template {template_path}: {e}")
-        traceback.print_exc()
+        logger.exception("Dettaglio errore apertura template")
+        fatal(f"Errore apertura template {template_path}: {e}")
         return
 
     target_excel_path = os.path.join(BASE_DIR, f"{project_safe}{out_ext}")
@@ -2349,7 +2507,7 @@ def main():
 
     if TEMPLATE_SHEET_NAME:
         if TEMPLATE_SHEET_NAME not in wb.sheetnames:
-            logger.error(
+            fatal(
                 f"Foglio '{TEMPLATE_SHEET_NAME}' non presente nel template. "
                 f"Fogli disponibili: {wb.sheetnames}"
             )
@@ -2364,9 +2522,6 @@ def main():
 
     # Data odierna
     ws[DATE_CELL] = datetime.now().strftime("%Y-%m-%d")
-
-    # Riga dati del template, da replicare per ogni pezzo.
-    template_row = snapshot_row(ws, DATA_START_ROW)
 
     # ---------------------------------------------------------------------
     # Ricerca file STEP
@@ -2383,96 +2538,97 @@ def main():
 
     logger.info(f"Avvio elaborazione: {len(step_files)} file STEP.")
 
-    processed_rows = 0
-    excel_row = DATA_START_ROW
+    # ---------------------------------------------------------------------
+    # 1) Analisi di tutti gli STEP: si conosce subito il numero di righe
+    #    (un file multibody può generarne più di una)
+    # ---------------------------------------------------------------------
+    results = []
+    errors = 0
 
-    # ---------------------------------------------------------------------
-    # Elaborazione STEP
-    # ---------------------------------------------------------------------
     for step_file in step_files:
+        name = os.path.basename(step_file)
         try:
             cfg = find_cfg_for_step(step_file, cfg_list)
 
             # Salta se non c'è configurazione valida
             if not cfg:
-                logger.info(f"SKIP '{os.path.basename(step_file)}'")
+                logger.info(f"SKIP '{name}'")
                 continue
 
-            # Analisi geometrica: può produrre più righe se multibody
-            rows = analyze_step_for_excel(step_file, cfg)
+            with capture_native_output():
+                rows = analyze_step_for_excel(step_file, cfg)
 
             if not rows:
-                logger.warning(f"Nessuna riga generata per '{os.path.basename(step_file)}'")
+                logger.warning(f"Nessuna riga generata per '{name}'")
                 continue
 
-            for data in rows:
-                # Inserimento riga Excel
-                if excel_row > DATA_START_ROW:
-                    insert_row_keep_layout(ws, excel_row)
-                    fill_row_from_template(ws, template_row, DATA_START_ROW, excel_row)
-
-                if ITEM_NO_COLUMN:
-                    ws[f"{ITEM_NO_COLUMN}{excel_row}"] = processed_rows + 1
-
-                # Dati CSV (se vuoti resta il segnaposto del template)
-                for key, col in SETTINGS_COLUMN_MAP.items():
-                    val = cfg_get(cfg, key, "")
-                    if str(val).strip():
-                        ws[f"{col}{excel_row}"] = excel_value(val)
-
-                # Logica Cell Z: Valutazione pressa (tonnellaggio)
-                press_text = str(cfg_get(cfg, "press", ""))
-                tons_list = [int(n) for n in re.findall(r"\d+", press_text)]
-                max_tons = max(tons_list) if tons_list else 0
-
-                ws[f"Z{excel_row}"] = "hydraulic" if max_tons > 550 else "mechanic"
-
-                # Dati analisi geometrica
-                mapping = {
-                    "B": "B",
-                    "I": "I",
-                    "N": "N",
-                    "O": "O",
-                    "P": "P",
-                    "V": "V",
-                }
-
-                if THICKNESS_MAX_COLUMN:
-                    mapping["N_max"] = THICKNESS_MAX_COLUMN
-
-                for key, col in mapping.items():
-                    val = data.get(key, "")
-                    if val is not None and str(val).strip():
-                        ws[f"{col}{excel_row}"] = val
-
-                # Immagine in colonna C
-                img_path = data.get("C")
-
-                if img_path and os.path.exists(img_path):
-                    try:
-                        img = XLImage(img_path)
-                        fit_image_in_cell(img, ws, "C", excel_row)
-                        ws.add_image(img, f"C{excel_row}")
-                    except Exception as img_exc:
-                        logger.warning(f"Errore inserimento immagine: {img_exc}")
-
-                processed_rows += 1
-
-                logger.info(
-                    f"Riga {excel_row}: {data['B']} | "
-                    f"Press: {max_tons}t -> {ws[f'Z{excel_row}'].value} | "
-                    f"Sliders: {data['V']}"
-                )
-
-                excel_row += 1
+            results.extend((cfg, data) for data in rows)
 
         except Exception as e:
-            logger.error(f"Errore su {step_file}: {e}")
-            traceback.print_exc()
-            continue
+            errors += 1
+            logger.exception(f"Errore su {name}: {e}")
 
-    # Totali sotto la tabella estesi a tutte le righe inserite
-    extend_total_formulas(ws, DATA_START_ROW, excel_row - 1)
+    # ---------------------------------------------------------------------
+    # 2) Righe del form inserite in un colpo solo, formule già corrette
+    # ---------------------------------------------------------------------
+    prepare_data_rows(ws, len(results))
+
+    # ---------------------------------------------------------------------
+    # 3) Scrittura dati
+    # ---------------------------------------------------------------------
+    for index, (cfg, data) in enumerate(results):
+        excel_row = DATA_START_ROW + index
+
+        if ITEM_NO_COLUMN:
+            ws[f"{ITEM_NO_COLUMN}{excel_row}"] = index + 1
+
+        # Dati CSV (se vuoti resta il segnaposto del template)
+        for key, col in SETTINGS_COLUMN_MAP.items():
+            val = cfg_get(cfg, key, "")
+            if str(val).strip():
+                ws[f"{col}{excel_row}"] = excel_value(key, val)
+
+        # Logica Cell Z: Valutazione pressa (tonnellaggio)
+        press_text = str(cfg_get(cfg, "press", ""))
+        tons_list = [int(n) for n in re.findall(r"\d+", press_text)]
+        max_tons = max(tons_list) if tons_list else 0
+
+        ws[f"Z{excel_row}"] = "hydraulic" if max_tons > 550 else "mechanic"
+
+        # Dati analisi geometrica
+        mapping = {
+            "B": "B",
+            "I": "I",
+            "N": "N",
+            "O": "O",
+            "P": "P",
+            "V": "V",
+        }
+
+        if THICKNESS_MAX_COLUMN:
+            mapping["N_max"] = THICKNESS_MAX_COLUMN
+
+        for key, col in mapping.items():
+            val = data.get(key, "")
+            if val is not None and str(val).strip():
+                ws[f"{col}{excel_row}"] = val
+
+        # Immagine in colonna C
+        img_path = data.get("C")
+
+        if img_path and os.path.exists(img_path):
+            try:
+                img = XLImage(img_path)
+                fit_image_in_cell(img, ws, "C", excel_row)
+                ws.add_image(img, f"C{excel_row}")
+            except Exception as img_exc:
+                logger.warning(f"Errore inserimento immagine: {img_exc}")
+
+        logger.info(
+            f"Riga {excel_row}: {data['B']} | "
+            f"Press: {max_tons}t -> {ws[f'Z{excel_row}'].value} | "
+            f"Sliders: {data['V']}"
+        )
 
     # ---------------------------------------------------------------------
     # Pulizia SVG residui
@@ -2489,12 +2645,27 @@ def main():
     # ---------------------------------------------------------------------
     try:
         wb.save(target_excel_path)
-        logger.info(f"Completato: {processed_rows} righe generate.")
-        logger.info(f"Salvato in: {target_excel_path}")
     except Exception as e:
-        logger.error(f"Errore salvataggio: {e}")
-        traceback.print_exc()
+        logger.exception("Dettaglio errore salvataggio")
+        fatal(f"Errore salvataggio {target_excel_path}: {e}")
+        return
+
+    summary = f"Completato: {len(results)} righe generate"
+    if errors:
+        summary += f", {errors} file STEP con errori"
+    logger.info(f"{summary}. Salvato in: {target_excel_path}")
+
+    print(f"{summary}.")
+    print(f"Excel: {target_excel_path}")
+    print(f"Log:   {LOG_FILE}")
 
 
 if __name__ == "__main__":
-    main()
+    setup_logging()
+    logger.info("=" * 80)
+    logger.info(f"Avvio {datetime.now():%Y-%m-%d %H:%M:%S}")
+    try:
+        main()
+    except Exception:
+        logger.exception("Errore non gestito")
+        print(f"Errore. Dettagli nel log: {LOG_FILE}")
