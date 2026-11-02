@@ -3,17 +3,19 @@
 Compilazione automatica form RFQ stampi (RFQ_molds_form.xlsx).
 
 Per ogni file STEP in input/ con una riga corrispondente in settings.csv
-(colonna 'cad_filename', stesso criterio di diagnostica.py):
+(colonna 'cad_filename', abbinamento in rfq_common.py, verificato prima
+da diagnostica.py):
 - volume e ingombro (bounding box), con repair di shell/superfici aperte
 - spessore pareti con ray-casting (nominale = mediana sulla superficie)
 - direzione di apertura stampo (analisi sottosquadri) e area proiettata
-- vista isometrica (se cairosvg è installato)
+- vista isometrica
 
 Gli assembly/multibody generano una riga per corpo.
 Output in output/: Excel compilato, viste, log completo (analisi.log).
 In console solo l'avanzamento.
 
-Controllare prima la corrispondenza STEP <-> settings.csv con diagnostica.py.
+Di norma si avvia con avvia_rfq.py (o l'eseguibile AVVIA_RFQ), che lancia
+prima la diagnostica.
 """
 
 import os
@@ -21,12 +23,12 @@ import re
 import sys
 import time
 import copy
-import csv
 import math
 import random
 import logging
 import tempfile
 import contextlib
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from types import SimpleNamespace
 from statistics import mean, median
@@ -36,6 +38,7 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.worksheet.cell_range import CellRange
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageDraw, ImageOps
 
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
@@ -62,27 +65,22 @@ from OCP.BRepTools import BRepTools
 from OCP.TopLoc import TopLoc_Location
 from OCP.IntCurvesFace import IntCurvesFace_ShapeIntersector
 from OCP.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Lin
+from cadquery.occ_impl.exporters.svg import getSVG
 
-try:
-    import cairosvg
-except Exception:
-    cairosvg = None
+from rfq_common import (
+    OUTPUT_DIR,
+    PATH_INPUT,
+    PATH_TEMPLATE,
+    cfg_get,
+    find_cfg_for_step,
+    list_step_files,
+    load_settings,
+)
 
 
 # =========================================================================
 # PERCORSI
 # =========================================================================
-# Cartella dello script; se eseguito in una cella notebook (es. Colab,
-# dove __file__ non esiste) la cartella corrente.
-BASE_DIR = (
-    os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
-    else os.getcwd()
-)
-
-PATH_SETTINGS = os.path.join(BASE_DIR, "settings.csv")
-PATH_TEMPLATE = os.path.join(BASE_DIR, "RFQ_molds_form.xlsx")
-PATH_INPUT = os.path.join(BASE_DIR, "input")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 OUTPUT_DIR_VISTE = os.path.join(OUTPUT_DIR, "viste")
 LOG_FILE = os.path.join(OUTPUT_DIR, "analisi.log")
 
@@ -133,6 +131,7 @@ PROJECTION_MESH_TOL_REL = 2e-4
 
 # Vista isometrica: tela con le proporzioni della cella "Part Picture",
 # senza assi e linee nascoste (illeggibili a quella dimensione).
+ISO_VIEW_SUPERSAMPLING = 3
 ISO_VIEW_OPTIONS = {
     "width": 480,
     "height": 300,
@@ -264,73 +263,8 @@ def capture_native_output():
 
 
 # =========================================================================
-# SETTINGS.CSV
+# VALORI DA SETTINGS.CSV
 # =========================================================================
-def normalize_key(value):
-    """'Part Name', 'part_name', 'PART-NAME' -> 'partname'."""
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-
-
-def cfg_get(cfg, key, default=""):
-    """Valore di una colonna del CSV, ignorando maiuscole, spazi e '_'."""
-    if key in cfg:
-        return cfg[key]
-
-    target = normalize_key(key)
-    for k, v in cfg.items():
-        if normalize_key(k) == target:
-            return v
-    return default
-
-
-def load_settings():
-    """Righe di settings.csv (delimitatore ';' o ',' riconosciuto)."""
-    if not os.path.exists(PATH_SETTINGS):
-        return []
-
-    with open(PATH_SETTINGS, "r", encoding="utf-8-sig", newline="") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        # Excel in italiano salva i CSV con ';' (la virgola è decimale).
-        try:
-            delimiter = csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
-        except csv.Error:
-            delimiter = ";" if sample.count(";") > sample.count(",") else ","
-
-        rows = []
-        for row in csv.DictReader(f, delimiter=delimiter):
-            clean = {
-                k.strip(): (v or "").strip()
-                for k, v in row.items()
-                if isinstance(k, str) and k.strip()
-            }
-            if any(clean.values()):
-                rows.append(clean)
-
-    logger.info(f"settings.csv: {len(rows)} righe, delimitatore '{delimiter}'")
-    return rows
-
-
-def find_cfg_for_step(filename, cfg_list):
-    """
-    Riga di settings.csv per un file STEP, con lo stesso criterio di
-    diagnostica.py: prima nome file identico, poi nome contenuto
-    (senza estensione, maiuscole/minuscole ignorate).
-    """
-    stem = os.path.splitext(filename)[0].lower()
-
-    for cfg in cfg_list:
-        if cfg_get(cfg, "cad_filename").strip() == filename:
-            return cfg
-
-    for cfg in cfg_list:
-        cad = os.path.splitext(cfg_get(cfg, "cad_filename").strip())[0].lower()
-        if cad and (cad in stem or stem in cad):
-            return cfg
-
-    return None
-
-
 def parse_csv_number(value, kind):
     """
     Testo numerico del CSV -> numero (None se non è un numero).
@@ -1006,22 +940,53 @@ def analyze_parting_and_projection(solids, shapes, cfg):
 # VISTA ISOMETRICA
 # =========================================================================
 def export_iso_image(shapes, safe_name):
-    """PNG isometrico in OUTPUT_DIR_VISTE, o None (serve cairosvg)."""
-    if cairosvg is None:
-        return None
+    """
+    PNG isometrico in OUTPUT_DIR_VISTE, o None.
 
-    svg_path = os.path.join(OUTPUT_DIR_VISTE, f"temp_{safe_name}.svg")
+    Le linee vengono dalla proiezione SVG di CadQuery (solo segmenti M/L
+    dentro un gruppo con trasformazione scale/translate) e sono disegnate
+    con Pillow: niente cairosvg, che su Windows richiede le DLL di Cairo.
+    """
     png_path = os.path.join(OUTPUT_DIR_VISTE, f"iso_{safe_name}.png")
     try:
-        cq.exporters.export(combine_shapes(shapes), svg_path, opt=ISO_VIEW_OPTIONS)
-        cairosvg.svg2png(url=svg_path, write_to=png_path)
+        root = ET.fromstring(getSVG(combine_shapes(shapes), ISO_VIEW_OPTIONS))
+        group = root.find("{http://www.w3.org/2000/svg}g")
+        scale, tx, ty = (
+            float(v) for v in re.findall(
+                r"scale\(([-\d.e]+),.*translate\(([-\d.e]+),\s*([-\d.e]+)\)",
+                group.get("transform"),
+            )[0]
+        )
+
+        ss = ISO_VIEW_SUPERSAMPLING
+        size = (int(float(root.get("width"))), int(float(root.get("height"))))
+        img = Image.new("L", (size[0] * ss, size[1] * ss), 255)
+        draw = ImageDraw.Draw(img)
+
+        for path in group.iter("{http://www.w3.org/2000/svg}path"):
+            for segment in re.split(r"(?=M)", path.get("d", "")):
+                nums = [float(n) for n in re.findall(r"[-\d.e]+", segment)]
+                pts = [
+                    (scale * (x + tx) * ss, -scale * (y + ty) * ss)
+                    for x, y in zip(nums[0::2], nums[1::2])
+                ]
+                if len(pts) > 1:
+                    draw.line(pts, fill=0, width=ss)
+
+        # Ritaglio sul disegno (CadQuery lo allinea in alto a sinistra).
+        img = img.resize(size, Image.LANCZOS)
+        left, top, right, bottom = ImageOps.invert(img).getbbox()
+        pad = 6
+        gray = img.convert("L").crop((left - pad, top - pad, right + pad, bottom + pad))
+
+        # Linee nere su sfondo trasparente: i bordi della cella restano visibili.
+        out = Image.new("RGBA", gray.size, "black")
+        out.putalpha(ImageOps.invert(gray))
+        out.save(png_path)
         return png_path
     except Exception as e:
         logger.warning(f"Impossibile generare la vista ISO: {e}")
         return None
-    finally:
-        if os.path.exists(svg_path):
-            os.remove(svg_path)
 
 
 # =========================================================================
@@ -1289,27 +1254,24 @@ def main():
 
     if not os.path.exists(PATH_TEMPLATE):
         fatal(f"Template non trovato: {PATH_TEMPLATE}")
-        return
+        return False
 
-    cfg_list = load_settings()
-    step_files = sorted(
-        f for f in os.listdir(PATH_INPUT) if f.lower().endswith((".step", ".stp"))
-    ) if os.path.isdir(PATH_INPUT) else []
+    cfg_list, delimiter = load_settings()
+    logger.info(f"settings.csv: {len(cfg_list)} righe, delimitatore '{delimiter}'")
+    step_files = list_step_files()
 
     if not step_files:
         fatal(f"Nessun file STEP in {PATH_INPUT}")
-        return
+        return False
 
     console(f"Compilazione RFQ: {len(step_files)} file STEP, {len(cfg_list)} righe in settings.csv")
-    if cairosvg is None:
-        logger.warning("cairosvg non installato: viste ISO non generate")
 
     # 1) Analisi di tutti gli STEP (un multibody può dare più righe)
     results = []
     errors = 0
     for i, name in enumerate(step_files, start=1):
         label = f"[{i}/{len(step_files)}] {name}"
-        cfg = find_cfg_for_step(name, cfg_list)
+        cfg, _ = find_cfg_for_step(name, cfg_list)
         if cfg is None:
             console(f"{label}: saltato, nessuna riga in settings.csv")
             continue
@@ -1350,7 +1312,7 @@ def main():
     except Exception as e:
         logger.exception("Dettaglio errore salvataggio")
         fatal(f"Impossibile salvare {target}: {e} (file aperto in Excel?)")
-        return
+        return False
 
     summary = f"Completato in {time.time() - start:.0f} s: {len(results)} righe"
     if errors:
@@ -1358,14 +1320,21 @@ def main():
     console(summary)
     console(f"Excel: {target}")
     console(f"Log:   {LOG_FILE}")
+    return errors == 0
 
 
-if __name__ == "__main__":
+def run():
+    """Compilazione completa; codice di uscita 0 se riuscita senza errori."""
     setup_logging()
     logger.info("=" * 80)
     logger.info(f"Avvio {datetime.now():%Y-%m-%d %H:%M:%S}")
     try:
-        main()
+        return 0 if main() else 1
     except Exception as e:
         logger.exception("Errore non gestito")
         fatal(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(run())

@@ -329,3 +329,11 @@ TSWLatexianTemp*
 # option is specified. Footnotes are the stored in a file with suffix Notes.bib.
 # Uncomment the next line to have this generated file ignored.
 #*Notes.bib
+
+# RFQ: build eseguibile e output
+.venv_build/
+AVVIA_RFQ.spec
+output/
+build/
+dist/
+__pycache__/
