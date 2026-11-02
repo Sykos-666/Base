@@ -1,8 +1,8 @@
 cadquery
 openpyxl
-# Area proiettata esatta (senza: fallback a griglia di raggi, più lento)
+# Area proiettata (unione delle proiezioni)
 shapely
 # Necessario a openpyxl per mantenere l'immagine del template e inserire le viste
 pillow
-# Opzionale: conversione SVG -> PNG delle viste isometriche
+# Viste isometriche (opzionale: senza, la colonna Part Picture resta vuota)
 cairosvg

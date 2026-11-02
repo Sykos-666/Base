@@ -1,33 +1,32 @@
 # -*- coding: utf-8 -*-
 """
+Compilazione automatica form RFQ stampi (RFQ_molds_form.xlsx).
 
-Compilazione automatica form RFQ stampi.
-Matching su colonna 'cad_filename' in settings.csv.
-
-Funzionalità:
-- analisi geometrica robusta
-- volume, bounding box
+Per ogni file STEP in input/ con una riga corrispondente in settings.csv
+(colonna 'cad_filename', stesso criterio di diagnostica.py):
+- volume e ingombro (bounding box), con repair di shell/superfici aperte
+- spessore pareti con ray-casting (nominale = mediana sulla superficie)
 - direzione di apertura stampo (analisi sottosquadri) e area proiettata
-  come unione esatta delle proiezioni (shapely)
-- diagnosi volume zero
-- repair automatico shell/solidi
-- repair con tolleranze multiple
-- spessore pareti con ray-casting (nominale, medio, massimo)
-- soglia massima spessore da CSV
-- log su file in output/ (in console solo il riepilogo finale)
-- analisi separata per singolo corpo se assembly/multibody
+- vista isometrica (se cairosvg è installato)
+
+Gli assembly/multibody generano una riga per corpo.
+Output in output/: Excel compilato, viste, log completo (analisi.log).
+In console solo l'avanzamento.
+
+Controllare prima la corrispondenza STEP <-> settings.csv con diagnostica.py.
 """
 
 import os
 import re
 import sys
-import contextlib
-import tempfile
+import time
 import copy
 import csv
 import math
 import random
 import logging
+import tempfile
+import contextlib
 from datetime import datetime
 from types import SimpleNamespace
 from statistics import mean, median
@@ -38,28 +37,26 @@ from openpyxl.worksheet.cell_range import CellRange
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
+
 import cadquery as cq
 
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.GProp import GProp_GProps
-from OCP.TopAbs import (
-    TopAbs_SOLID,
-    TopAbs_COMPSOLID,
-    TopAbs_COMPOUND,
-    TopAbs_SHELL,
-    TopAbs_FACE,
-)
+from OCP.TopAbs import TopAbs_SOLID, TopAbs_COMPSOLID, TopAbs_SHELL, TopAbs_FACE
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
-
 from OCP.ShapeFix import ShapeFix_Shape
-from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_Sewing,
+    BRepBuilderAPI_MakeSolid,
+    BRepBuilderAPI_MakeVertex,
+)
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS
+from OCP.TopoDS import TopoDS, TopoDS_Compound
 from OCP.BRep import BRep_Tool, BRep_Builder
-from OCP.TopoDS import TopoDS_Compound
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTools import BRepTools
 from OCP.TopLoc import TopLoc_Location
@@ -75,768 +72,272 @@ except Exception:
 # =========================================================================
 # PERCORSI
 # =========================================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Cartella dello script; se eseguito in una cella notebook (es. Colab,
+# dove __file__ non esiste) la cartella corrente.
+BASE_DIR = (
+    os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+    else os.getcwd()
+)
 
 PATH_SETTINGS = os.path.join(BASE_DIR, "settings.csv")
+PATH_TEMPLATE = os.path.join(BASE_DIR, "RFQ_molds_form.xlsx")
 PATH_INPUT = os.path.join(BASE_DIR, "input")
-OUTPUT_DIR_VISTE = os.path.join(BASE_DIR, "viste")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+OUTPUT_DIR_VISTE = os.path.join(OUTPUT_DIR, "viste")
 LOG_FILE = os.path.join(OUTPUT_DIR, "analisi.log")
 
 
 # =========================================================================
-# CONFIGURAZIONE GENERALE
+# CONFIGURAZIONE
 # =========================================================================
-DEBUG_GEOMETRY = True
+# Repair di shell/superfici aperte: tolleranze dalla più fine alla più
+# aggressiva (si tiene il risultato con volume maggiore).
+REPAIR_TOLERANCES = [1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
 
-# Tolleranze usate per il repair progressivo.
-# Dalla più fine alla più aggressiva.
-REPAIR_TOLERANCES = [
-    1e-5,
-    5e-5,
-    1e-4,
-    5e-4,
-    1e-3,
-]
+# Assembly/multibody analizzati corpo per corpo (una riga per corpo).
+PROCESS_ASSEMBLY_BODIES_SEPARATELY = True
 
-# Valore usato se il CSV non definisce una soglia massima.
+# Spessore massimo misurabile se il CSV non ha 'max_thickness_mm'.
 DEFAULT_MAX_THICKNESS_MM = 150.0
 
-# Parametri misura spessore (ray-casting).
-# Numero di raggi per corpo: i punti di partenza sono distribuiti
-# uniformemente sulla superficie (campionamento pesato sull'area).
+# Spessore (ray-casting): raggi per corpo, da punti distribuiti
+# uniformemente sulla superficie.
 THICKNESS_RAY_COUNT = 3000
-# Angolo massimo tra il raggio e la normale della parete opposta:
-# oltre questo valore il raggio ha colpito una parete laterale
-# (spigoli, raccordi) e il campione viene scartato.
+# Angolo massimo tra il raggio e la normale della parete d'uscita: oltre,
+# il raggio ha colpito una parete laterale e il campione è scartato.
 THICKNESS_MAX_EXIT_ANGLE_DEG = 45.0
 # Distanza minima per ignorare l'intersezione con la faccia di partenza.
 THICKNESS_MIN_MM = 1e-3
-# Se diametro sfera inscritta / lunghezza raggio è sotto questa soglia,
+# Diametro sfera inscritta / lunghezza raggio sotto questa soglia:
 # il raggio non ha attraversato una parete e viene scartato.
 THICKNESS_SPHERE_RATIO = 0.5
 # Seme fisso: risultati ripetibili a ogni esecuzione.
-THICKNESS_RANDOM_SEED = 12345
-
-# Se True, gli assembly/multibody vengono analizzati corpo per corpo.
-PROCESS_ASSEMBLY_BODIES_SEPARATELY = True
-
-
-# =========================================================================
-# CONFIGURAZIONE TEMPLATE EXCEL
-# =========================================================================
-# Nomi cercati nella cartella dello script, in ordine di priorità.
-# Se nessuno esiste, viene cercato un qualsiasi file "*rfq*form*.xls*".
-TEMPLATE_CANDIDATES = [
-    "RFQ_molds_form.xlsx",
-    "RFQ_molds_form.xlsm",
-    "RFQ_molds_form.xltx",
+RANDOM_SEED = 12345
+# Classi dell'istogramma spessori nel log (mm).
+THICKNESS_HISTOGRAM_EDGES = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0,
+    float("inf"),
 ]
 
-# Nome del foglio del form. None = foglio attivo del template.
-TEMPLATE_SHEET_NAME = None
+# Direzione di apertura: punti campionati per l'analisi sottosquadri.
+PARTING_RAY_COUNT = 2000
+# Facce entro questo angolo dalla direzione di apertura sono pareti
+# parallele all'apertura (senza sformo), non sottosquadri.
+PARTING_NEUTRAL_DEG = 0.5
+# Differenza di area in sottosquadro (frazione della superficie) entro cui
+# due direzioni sono considerate equivalenti.
+PARTING_TIE_REL = 0.005
+# Deflessione mesh per l'area proiettata, relativa alla diagonale bbox
+# e limitata a [0.005, 0.05] mm.
+PROJECTION_MESH_TOL_REL = 2e-4
 
-# Prima riga dati del form, colonna numero progressivo e cella della data.
-# La riga dati del template (formule, "please fill", stili) viene
-# replicata per ogni pezzo; le formule di totale sotto (es. SUM(AQ3:AQ3))
-# vengono estese a tutte le righe inserite.
+# Vista isometrica: tela con le proporzioni della cella "Part Picture",
+# senza assi e linee nascoste (illeggibili a quella dimensione).
+ISO_VIEW_OPTIONS = {
+    "width": 480,
+    "height": 300,
+    "marginLeft": 20,
+    "marginTop": 20,
+    "showAxes": False,
+    "showHidden": False,
+    "projectionDir": (1, -1, 0.75),
+}
+
+AXIS_DIRECTIONS = {
+    "X": (1.0, 0.0, 0.0),
+    "Y": (0.0, 1.0, 0.0),
+    "Z": (0.0, 0.0, 1.0),
+}
+
+
+# =========================================================================
+# CONFIGURAZIONE FORM EXCEL
+# =========================================================================
+# Riga dati del template: viene replicata per ogni pezzo (stili, formule,
+# "please fill"); i totali sotto la tabella (es. SUM(AQ3:AQ3)) vengono
+# estesi a tutte le righe.
 DATA_START_ROW = 3
 ITEM_NO_COLUMN = "A"
 DATE_CELL = "E5"
 
-# Colonne del CSV da scrivere come numeri (chiavi normalizzate, senza
-# spazi/underscore). "decimal" accetta la virgola come separatore decimale.
-CSV_NUMERIC_KEYS = {
-    "density": "decimal",
-    "cycletime": "decimal",
-    "demandaverageyearlyvolume": "integer",
-    "cavities": "integer",
-    "dropnumber": "integer",
-    "moldlifetime": "integer",
+# Colonne settings.csv -> colonne Excel.
+SETTINGS_COLUMN_MAP = {
+    "demand_average_yearly_volume": "D",
+    "raw_material": "E",
+    "color": "F",
+    "surface_finishing": "G",
+    "cavities": "H",
+    "density": "K",
+    "inserts_steel": "Q",
+    "sliders_steel": "R",
+    "slider+lifter_Type/Qty": "V",
+    "gate_type": "W",
+    "drop_number": "Y",
+    "mold_lifetime": "AA",
+    "cycle_time": "AM",
+    "press": "AN",
 }
 
-# Colonna Excel per lo spessore massimo (es. "M"). None = non scritto.
+# Colonne del CSV scritte come numeri, perché usate nelle formule del
+# template (es. peso L = I/1000*K). "decimal" accetta la virgola decimale.
+CSV_NUMERIC_KEYS = {
+    "density": "decimal",
+    "cycle_time": "decimal",
+    "demand_average_yearly_volume": "integer",
+    "cavities": "integer",
+    "drop_number": "integer",
+    "mold_lifetime": "integer",
+}
+
+# Colonna Excel per lo spessore massimo (P98), es. "M". None = non scritto.
 THICKNESS_MAX_COLUMN = None
 
 
 # =========================================================================
-# LOGGING
+# LOG E CONSOLE
 # =========================================================================
-# Tutti i messaggi (report geometrici, avvisi, errori con traceback,
-# warning Python delle librerie) vanno nel file di log in output\.
-# In console compare solo il riepilogo finale.
+# Nel log va tutto (report geometrici, avvisi, traceback, warning Python,
+# messaggi nativi di OpenCASCADE); in console solo l'avanzamento, che
+# viene comunque ripetuto nel log.
 logger = logging.getLogger("analisi_rfq")
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
 
+def setup_logging():
+    if logger.handlers:
+        return
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(handler)
+
+    logging.captureWarnings(True)
+    logging.getLogger("py.warnings").addHandler(handler)
+
+
+def console(message):
+    """Messaggio in console e nel log."""
+    print(message, flush=True)
+    logger.info(message)
+
+
 def fatal(message):
-    """Errore che blocca l'esecuzione: nel log e, in breve, in console."""
+    """Errore che blocca l'esecuzione."""
     logger.error(message)
-    print(f"ERRORE: {message}")
-    print(f"Dettagli nel log: {LOG_FILE}")
+    print(f"ERRORE: {message}\nDettagli nel log: {LOG_FILE}", flush=True)
 
 
 @contextlib.contextmanager
 def capture_native_output():
     """
-    Cattura i messaggi che OpenCASCADE (codice C++) scrive direttamente
-    su stdout/stderr, ad es. errori di lettura STEP, e li scrive nel log
-    invece che in console.
+    Cattura i messaggi che OpenCASCADE (C++) scrive direttamente su
+    stdout/stderr, ad es. errori di lettura STEP, e li scrive nel log.
     """
     saved = []
-    tmp = None
-
+    tmp = tempfile.TemporaryFile()
     try:
-        tmp = tempfile.TemporaryFile()
         sys.stdout.flush()
         sys.stderr.flush()
         for fd in (1, 2):
             saved.append((fd, os.dup(fd)))
             os.dup2(tmp.fileno(), fd)
     except Exception:
-        # Console non standard (es. alcuni IDE): nessuna cattura.
-        for fd, copy_fd in saved:
-            os.dup2(copy_fd, fd)
-            os.close(copy_fd)
-        saved = []
+        # Console non standard (alcuni IDE): nessuna cattura.
+        pass
 
     try:
         yield
     finally:
-        if saved:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            for fd, copy_fd in saved:
-                os.dup2(copy_fd, fd)
-                os.close(copy_fd)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for fd, copy_fd in saved:
+            os.dup2(copy_fd, fd)
+            os.close(copy_fd)
 
-        if tmp is not None:
-            try:
-                tmp.seek(0)
-                text = tmp.read().decode("utf-8", "replace")
-                text = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
-                if text:
-                    logger.warning(f"Messaggi OpenCASCADE:\n{text}")
-            finally:
-                tmp.close()
-
-
-def setup_logging():
-    """Configura il log su file in OUTPUT_DIR."""
-    if logger.handlers:
-        return
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    )
-    logger.addHandler(file_handler)
-
-    # Warning Python (es. openpyxl) nel log invece che in console.
-    logging.captureWarnings(True)
-    logging.getLogger("py.warnings").addHandler(file_handler)
+        tmp.seek(0)
+        text = re.sub(r"\x1b\[[0-9;]*m", "", tmp.read().decode("utf-8", "replace")).strip()
+        tmp.close()
+        if text:
+            logger.warning(f"Messaggi OpenCASCADE:\n{text}")
 
 
 # =========================================================================
-# FUNZIONI GENERICHE
+# SETTINGS.CSV
 # =========================================================================
-def sanitize_filename(value):
-    """Rende una stringa sicura come nome file."""
-    value = str(value or "").strip()
-    value = re.sub(r"[^\w\-]+", "_", value, flags=re.UNICODE)
-    return value.strip("_") or "Default_Project"
-
-
 def normalize_key(value):
-    """Normalizza nomi di colonna/chiavi CSV per matching robusto."""
-    value = str(value or "").strip().lower()
-    value = re.sub(r"[^a-z0-9]+", "", value)
-    return value
+    """'Part Name', 'part_name', 'PART-NAME' -> 'partname'."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
 def cfg_get(cfg, key, default=""):
-    """
-    Legge un valore dal dizionario cfg in modo robusto.
-    Gestisce differenze tipo:
-    - 'part_name'
-    - 'part name'
-    - 'Part Name'
-    - 'PART_NAME'
-    """
-    if not cfg:
-        return default
+    """Valore di una colonna del CSV, ignorando maiuscole, spazi e '_'."""
+    if key in cfg:
+        return cfg[key]
 
     target = normalize_key(key)
-    if not target:
-        return default
-
-    val = None
-
-    # Match diretto
-    if key in cfg:
-        val = cfg[key]
-
-    # Match normalizzato
-    if val is None:
-        for k, v in cfg.items():
-            if normalize_key(k) == target:
-                val = v
-                break
-
-    # Tentativi extra con spazi/underscore
-    if val is None:
-        variants = [
-            key.replace("_", " "),
-            key.replace(" ", "_"),
-        ]
-        for variant in variants:
-            if variant in cfg:
-                val = cfg[variant]
-                break
-
-    return default if val is None else val
+    for k, v in cfg.items():
+        if normalize_key(k) == target:
+            return v
+    return default
 
 
-def normalize_filename(value):
-    """Normalizza il nome file per matching robusto."""
-    value = os.path.basename(str(value or ""))
-    value = os.path.splitext(value)[0]
-    value = re.sub(r"[^a-z0-9]+", "", value.lower())
-    return value
+def load_settings():
+    """Righe di settings.csv (delimitatore ';' o ',' riconosciuto)."""
+    if not os.path.exists(PATH_SETTINGS):
+        return []
 
-
-def parse_float_value(value):
-    """Converte un valore in float in modo robusto."""
-    if value is None:
-        return None
-
-    txt = str(value).strip().replace(",", ".")
-    if not txt:
-        return None
-
-    try:
-        return float(txt)
-    except Exception:
-        return None
-
-
-def get_max_thickness_from_cfg(cfg):
-    """
-    Legge la soglia massima di spessore dal CSV.
-
-    Chiavi supportate:
-    - max_thickness_mm
-    - thickness_max_mm
-    - max thickness mm
-    - spessore_max_mm
-    """
-    keys = [
-        "max_thickness_mm",
-        "thickness_max_mm",
-        "max thickness mm",
-        "spessore_max_mm",
-        "max_thickness",
-        "thickness_max",
-    ]
-
-    for key in keys:
-        val = parse_float_value(cfg_get(cfg, key, ""))
-        if val is not None and val > 0:
-            return float(val)
-
-    return float(DEFAULT_MAX_THICKNESS_MM)
-
-
-# =========================================================================
-# SUPPORTO OCCT / CADQUERY
-# =========================================================================
-def wrap_occ(shape):
-    """Ritorna l'oggetto OCCT sottostante, se presente."""
-    return getattr(shape, "wrapped", shape)
-
-
-def wrap_cq(wrapped):
-    """Prova a trasformare un oggetto OCCT in oggetto CadQuery."""
-    if wrapped is None:
-        return None
-
-    if hasattr(wrapped, "wrapped"):
-        return wrapped
-
-    try:
-        return cq.Shape.cast(wrapped)
-    except Exception:
-        return None
-
-
-def gprop_call(name, wrapped, props):
-    """
-    Chiama un metodo statico di BRepGProp (VolumeProperties, SurfaceProperties).
-
-    Nel binding OCP (usato da CadQuery) i metodi statici hanno il suffisso
-    '_s' (es. BRepGProp.VolumeProperties_s): chiamare la versione senza
-    suffisso solleva AttributeError. Il fallback senza suffisso resta per
-    compatibilità con pythonocc.
-    """
-    fn = getattr(BRepGProp, name + "_s", None) or getattr(BRepGProp, name)
-    fn(wrapped, props)
-    return props
-
-
-def signed_volume(wrapped):
-    """
-    Volume con segno: negativo se il solido è orientato al contrario
-    (normali delle facce verso l'interno).
-    """
-    props = gprop_call("VolumeProperties", wrapped, GProp_GProps())
-    return float(props.Mass())
-
-
-def occ_signature(wrapped):
-    """
-    Firma geometrica semplice per ridurre duplicati.
-    Usa volume + baricentro. Se non riesce, usa id().
-    """
-    if wrapped is None:
-        return None
-
-    try:
-        props = gprop_call("VolumeProperties", wrapped, GProp_GProps())
-        c = props.CentreOfMass()
-        return (
-            round(float(props.Mass()), 6),
-            round(float(c.X()), 3),
-            round(float(c.Y()), 3),
-            round(float(c.Z()), 3),
-        )
-    except Exception:
+    with open(PATH_SETTINGS, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        # Excel in italiano salva i CSV con ';' (la virgola è decimale).
         try:
-            return id(wrapped)
-        except Exception:
-            return None
+            delimiter = csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
+        except csv.Error:
+            delimiter = ";" if sample.count(";") > sample.count(",") else ","
+
+        rows = []
+        for row in csv.DictReader(f, delimiter=delimiter):
+            clean = {
+                k.strip(): (v or "").strip()
+                for k, v in row.items()
+                if isinstance(k, str) and k.strip()
+            }
+            if any(clean.values()):
+                rows.append(clean)
+
+    logger.info(f"settings.csv: {len(rows)} righe, delimitatore '{delimiter}'")
+    return rows
 
 
-def shape_type_name(shape_type):
-    """Nome leggibile del tipo shape OCCT."""
-    mapping = {
-        TopAbs_SOLID: "SOLID",
-        TopAbs_COMPSOLID: "COMPSOLID",
-        TopAbs_COMPOUND: "COMPOUND",
-        TopAbs_SHELL: "SHELL",
-        TopAbs_FACE: "FACE",
-    }
-    return mapping.get(shape_type, f"TYPE_{shape_type}")
-
-
-# =========================================================================
-# GEOMETRIA BASE
-# =========================================================================
-def get_top_shapes(imported):
+def find_cfg_for_step(filename, cfg_list):
     """
-    Estrae gli oggetti Shape da un risultato importStep.
-    Gestisce Workplane, Assembly/Compound e oggetti già Shape.
+    Riga di settings.csv per un file STEP, con lo stesso criterio di
+    diagnostica.py: prima nome file identico, poi nome contenuto
+    (senza estensione, maiuscole/minuscole ignorate).
     """
-    objs = []
+    stem = os.path.splitext(filename)[0].lower()
 
-    # Workplane / oggetti con vals()
-    if hasattr(imported, "vals"):
-        try:
-            vals = imported.vals()
-            if isinstance(vals, (list, tuple)):
-                objs.extend(vals)
-            elif vals is not None:
-                objs.append(vals)
-        except Exception:
-            pass
-
-    # Se non ha vals(), prova val()
-    if not objs and hasattr(imported, "val"):
-        try:
-            v = imported.val()
-            if v is not None:
-                objs.append(v)
-        except Exception:
-            pass
-
-    # Se è un Assembly, prova a convertirlo in Compound
-    if not objs and hasattr(imported, "toCompound"):
-        try:
-            c = imported.toCompound()
-            if c is not None:
-                objs.append(c)
-        except Exception:
-            pass
-
-    # Se è già una Shape
-    if not objs and hasattr(imported, "wrapped"):
-        objs.append(imported)
-
-    # Filtra oggetti nulli
-    valid_objs = []
-    for o in objs:
-        try:
-            w = getattr(o, "wrapped", o)
-            if w is not None and not w.IsNull():
-                valid_objs.append(o)
-        except Exception:
-            continue
-
-    return valid_objs
-
-
-def combine_shapes(shapes):
-    """Combina più shape in un compound, se possibile."""
-    shapes = [s for s in shapes if s is not None]
-
-    if not shapes:
-        return None
-
-    if len(shapes) == 1:
-        return shapes[0]
-
-    try:
-        return cq.Compound.makeCompound(shapes)
-    except Exception:
-        return shapes[0]
-
-
-def safe_volume(shape):
-    """
-    Calcola il volume in modo robusto usando direttamente OpenCASCADE.
-    Ritorna 0.0 se il volume non è calcolabile.
-    """
-    if shape is None:
-        return 0.0
-
-    wrapped = getattr(shape, "wrapped", shape)
-    if wrapped is None:
-        return 0.0
-
-    try:
-        if wrapped.IsNull():
-            return 0.0
-    except Exception:
-        return 0.0
-
-    try:
-        shape_type = wrapped.ShapeType()
-    except Exception:
-        return 0.0
-
-    # Consideriamo solo forme potenzialmente volumetriche
-    if shape_type not in (
-        TopAbs_SOLID,
-        TopAbs_COMPSOLID,
-        TopAbs_COMPOUND,
-        TopAbs_SHELL,
-    ):
-        return 0.0
-
-    # Se è una shell, proviamo solo se chiusa
-    if shape_type == TopAbs_SHELL:
-        try:
-            if not wrapped.Closed():
-                return 0.0
-        except Exception:
-            pass
-
-    try:
-        return abs(signed_volume(wrapped))
-    except Exception as e:
-        logger.debug(f"Volume non calcolabile: {e}")
-        return 0.0
-
-
-def safe_surface_area(shape):
-    """
-    Calcola l'area superficiale in modo robusto usando direttamente OpenCASCADE.
-    Ritorna 0.0 se non calcolabile.
-    """
-    if shape is None:
-        return 0.0
-
-    wrapped = getattr(shape, "wrapped", shape)
-    if wrapped is None:
-        return 0.0
-
-    try:
-        if wrapped.IsNull():
-            return 0.0
-    except Exception:
-        return 0.0
-
-    try:
-        props = gprop_call("SurfaceProperties", wrapped, GProp_GProps())
-        return abs(float(props.Mass()))
-    except Exception as e:
-        logger.debug(f"Area non calcolabile: {e}")
-        return 0.0
-
-
-def collect_solids(shapes):
-    """Raccoglie tutti i Solid dalle shape fornite."""
-    solids = []
-    seen_ids = set()
-
-    for sh in shapes:
-        if id(sh) in seen_ids:
-            continue
-
-        # Prova con metodo Solids()
-        try:
-            ss = sh.Solids()
-            if ss:
-                for s in ss:
-                    if id(s) not in seen_ids:
-                        solids.append(s)
-                        seen_ids.add(id(s))
-                continue
-        except Exception:
-            pass
-
-        # Se non ha Solids() ma è esso stesso un Solid
-        try:
-            w = getattr(sh, "wrapped", None)
-            if w is not None and not w.IsNull() and w.ShapeType() == TopAbs_SOLID:
-                solids.append(sh)
-                seen_ids.add(id(sh))
-        except Exception:
-            pass
-
-    return solids
-
-
-def collect_faces(shapes):
-    """Raccoglie tutte le Face dalle shape fornite."""
-    faces = []
-    seen_ids = set()
-
-    for sh in shapes:
-        if id(sh) in seen_ids:
-            continue
-
-        # Prova con metodo Faces()
-        try:
-            fs = sh.Faces()
-            if fs:
-                for f in fs:
-                    if id(f) not in seen_ids:
-                        faces.append(f)
-                        seen_ids.add(id(f))
-                continue
-        except Exception:
-            pass
-
-        # Se non ha Faces() ma è esso stesso una Face
-        try:
-            w = getattr(sh, "wrapped", None)
-            if w is not None and not w.IsNull() and w.ShapeType() == TopAbs_FACE:
-                faces.append(sh)
-                seen_ids.add(id(sh))
-        except Exception:
-            pass
-
-    return faces
-
-
-def safe_face_area(face):
-    """Calcola area di una faccia in modo sicuro."""
-    try:
-        return float(face.Area())
-    except Exception:
-        return safe_surface_area(face)
-
-
-def safe_bounding_box(shapes):
-    """
-    Calcola il bounding box in modo robusto usando direttamente OpenCASCADE.
-    Ritorna un oggetto SimpleNamespace con xlen, ylen, zlen.
-    """
-    if not shapes:
-        return None
-
-    bbox = Bnd_Box()
-    added = False
-
-    for sh in shapes:
-        wrapped = getattr(sh, "wrapped", sh)
-        if wrapped is None:
-            continue
-
-        try:
-            if wrapped.IsNull():
-                continue
-        except Exception:
-            continue
-
-        try:
-            BRepBndLib.Add_s(wrapped, bbox, False)
-            added = True
-        except Exception:
-            try:
-                BRepBndLib.Add(wrapped, bbox)
-                added = True
-            except Exception:
-                continue
-
-    if not added:
-        return None
-
-    try:
-        if bbox.IsVoid():
-            return None
-    except Exception:
-        pass
-
-    try:
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-    except Exception:
-        return None
-
-    return SimpleNamespace(
-        xmin=xmin,
-        ymin=ymin,
-        zmin=zmin,
-        xmax=xmax,
-        ymax=ymax,
-        zmax=zmax,
-        xlen=max(0.0, xmax - xmin),
-        ylen=max(0.0, ymax - ymin),
-        zlen=max(0.0, zmax - zmin),
-    )
-
-
-def bbox_diagonal(shapes):
-    """Diagonale del bounding box, utile come limite massimo spessore."""
-    bb = safe_bounding_box(shapes)
-    if bb is None:
-        return 100.0
-
-    return math.sqrt(
-        bb.xlen * bb.xlen +
-        bb.ylen * bb.ylen +
-        bb.zlen * bb.zlen
-    )
-
-
-# =========================================================================
-# MATCHING CSV
-# =========================================================================
-def find_cfg_for_step(step_path, cfg_list):
-    """
-    Trova la configurazione CSV usando 'cad_filename' con matching flessibile.
-    Restituisce {} se non trova corrispondenza.
-    """
-    if not cfg_list:
-        return {}
-
-    filename = os.path.basename(str(step_path))
-    stem = os.path.splitext(filename)[0]
-    file_norm = normalize_filename(filename)
-
-    # 1) Match esatto su nome file completo o stem
     for cfg in cfg_list:
-        cad_name = str(cfg_get(cfg, "cad_filename", "")).strip()
-        if not cad_name:
-            continue
-
-        cad_base = os.path.basename(cad_name)
-        cad_stem = os.path.splitext(cad_base)[0]
-
-        if cad_base.lower() == filename.lower():
+        if cfg_get(cfg, "cad_filename").strip() == filename:
             return cfg
 
-        if cad_stem.lower() == stem.lower():
-            return cfg
-
-    # 2) Match normalizzato / sottostringa
     for cfg in cfg_list:
-        cad_name = str(cfg_get(cfg, "cad_filename", "")).strip()
-        if not cad_name:
-            continue
-
-        cad_norm = normalize_filename(cad_name)
-
-        if not cad_norm or not file_norm:
-            continue
-
-        if file_norm in cad_norm or cad_norm in file_norm:
-            logger.info(f"Match flessibile: '{filename}' ↔ cad_filename='{cad_name}'")
+        cad = os.path.splitext(cfg_get(cfg, "cad_filename").strip())[0].lower()
+        if cad and (cad in stem or stem in cad):
             return cfg
 
-    logger.warning(
-        f"Nessuna config per '{filename}'. "
-        f"Verificare 'cad_filename' in settings.csv."
-    )
-    return {}
-
-
-# =========================================================================
-# EXCEL
-# =========================================================================
-def snapshot_row(ws, row):
-    """Valori e stili di una riga del template, prima di sovrascriverla."""
-    result = []
-    for col in range(1, ws.max_column + 1):
-        cell = ws.cell(row=row, column=col)
-        result.append((col, cell.value, copy.copy(cell._style)))
-    return result
-
-
-def fill_row_from_template(ws, snapshot, src_row, dst_row):
-    """
-    Riproduce la riga dati del template su dst_row: stili, segnaposto
-    ('please fill') e formule riferite alla nuova riga
-    (es. =SUM(I3:J3)/1000*K3 -> =SUM(I5:J5)/1000*K5).
-    """
-    for col, value, style in snapshot:
-        cell = ws.cell(row=dst_row, column=col)
-        cell._style = copy.copy(style)
-
-        if isinstance(value, str) and value.startswith("="):
-            letter = get_column_letter(col)
-            value = Translator(value, origin=f"{letter}{src_row}").translate_formula(
-                f"{letter}{dst_row}"
-            )
-
-        cell.value = value
-
-
-def extend_total_formulas(ws, first_row, last_row):
-    """
-    Estende alle righe inserite gli intervalli delle formule sotto la tabella
-    che coprivano solo la riga dati del template: SUM(AQ3:AQ3) -> SUM(AQ3:AQ7).
-    """
-    if last_row <= first_row:
-        return
-
-    pattern = re.compile(
-        r"(?<![A-Za-z$])(\$?[A-Z]{1,3}\$?)%d:(\$?[A-Z]{1,3}\$?)%d(?!\d)"
-        % (first_row, first_row)
-    )
-
-    for row in ws.iter_rows(min_row=last_row + 1):
-        for cell in row:
-            if isinstance(cell.value, str) and cell.value.startswith("="):
-                cell.value = pattern.sub(
-                    lambda m: f"{m.group(1)}{first_row}:{m.group(2)}{last_row}",
-                    cell.value,
-                )
+    return None
 
 
 def parse_csv_number(value, kind):
     """
-    Converte un testo numerico del CSV in numero.
+    Testo numerico del CSV -> numero (None se non è un numero).
 
-    kind = "decimal": '1,05', '1.05', '1,05 g/cm3' -> 1.05;
-                      '1.234,5' / '1,234.5' -> 1234.5
-                      (con entrambi i separatori, l'ultimo è il decimale).
-    kind = "integer": '100.000', '100,000', '100 000 pz' -> 100000.
-
-    Ritorna None se il testo non contiene un numero.
+    "decimal": '1,05', '1.05', '1,05 g/cm3' -> 1.05; con entrambi i
+               separatori l'ultimo è il decimale ('1.234,5' -> 1234.5).
+    "integer": '100.000', '100,000', '100 000 pz' -> 100000.
     """
     if isinstance(value, (int, float)):
         return value
@@ -853,8 +354,7 @@ def parse_csv_number(value, kind):
 
     if "," in txt and "." in txt:
         dec = "," if txt.rfind(",") > txt.rfind(".") else "."
-        thousands = "." if dec == "," else ","
-        txt = txt.replace(thousands, "").replace(dec, ".")
+        txt = txt.replace("." if dec == "," else ",", "").replace(dec, ".")
     else:
         txt = txt.replace(",", ".")
 
@@ -866,15 +366,12 @@ def parse_csv_number(value, kind):
 
 def excel_value(key, value):
     """
-    Valore da scrivere nel form per una colonna del CSV.
-
-    Le colonne in CSV_NUMERIC_KEYS vengono scritte come NUMERI, non come
-    testo, perché usate nelle formule del template (es. peso L = I/1000*K
-    con K = densità). Nel file .xlsx il numero è salvato senza separatore:
-    Excel in italiano lo mostra con la virgola (1,05) secondo il formato
-    della cella. Un testo "1,05" invece darebbe #VALORE! nelle formule.
+    Valore da scrivere nel form per una colonna del CSV. Le colonne
+    numeriche vanno scritte come numeri: nel file .xlsx il numero non ha
+    separatore ed Excel in italiano lo mostra con la virgola (1,05);
+    il testo "1,05" darebbe invece #VALORE! nelle formule.
     """
-    kind = CSV_NUMERIC_KEYS.get(normalize_key(key))
+    kind = CSV_NUMERIC_KEYS.get(key)
     if kind is None:
         return value
 
@@ -882,594 +379,192 @@ def excel_value(key, value):
     if number is None:
         logger.warning(f"Valore non numerico per '{key}': '{value}' (scritto come testo)")
         return value
-
     return number
 
 
-def fit_image_in_cell(img, ws, col_letter, row):
-    """Ridimensiona l'immagine nella cella mantenendo le proporzioni."""
-    col_width = ws.column_dimensions[col_letter].width or 8.43
-    row_height = ws.row_dimensions[row].height or 15.0
-
-    box_w = col_width * 7.0 + 5.0 - 6.0      # pixel, con un piccolo margine
-    box_h = row_height * 96.0 / 72.0 - 6.0
-
-    scale = min(box_w / img.width, box_h / img.height)
-    img.width = max(1, int(img.width * scale))
-    img.height = max(1, int(img.height * scale))
-
-
-def insert_rows_keep_layout(ws, row_idx, amount):
-    """
-    Inserisce 'amount' righe prima di row_idx come ws.insert_rows(), ma
-    sposta anche celle unite, altezze righe e immagini sottostanti:
-    openpyxl non lo fa, e senza questo il layout del template
-    (intestazioni, note, logo) si rompe.
-    """
-    if amount <= 0:
-        return
-
-    merged_below = [
-        str(rng) for rng in ws.merged_cells.ranges
-        if rng.min_row >= row_idx
-    ]
-    for ref in merged_below:
-        ws.unmerge_cells(ref)
-
-    heights = {
-        r: dim.height
-        for r, dim in ws.row_dimensions.items()
-        if r >= row_idx and dim.height is not None
-    }
-
-    ws.insert_rows(row_idx, amount)
-
-    for ref in merged_below:
-        rng = CellRange(ref)
-        rng.shift(row_shift=amount)
-        ws.merge_cells(rng.coord)
-
-    for r in heights:
-        ws.row_dimensions[r].height = None
-    for r, h in heights.items():
-        ws.row_dimensions[r + amount].height = h
-
-    # Le nuove righe prendono l'altezza della riga sopra (riga dati template).
-    for r in range(row_idx, row_idx + amount):
-        ws.row_dimensions[r].height = ws.row_dimensions[row_idx - 1].height
-
-    # Immagini del template ancorate sotto le righe inserite.
-    for img in getattr(ws, "_images", []):
-        anchor = img.anchor
-        if isinstance(anchor, str):
-            continue
-        for marker in (getattr(anchor, "_from", None), getattr(anchor, "to", None)):
-            if marker is not None and marker.row >= row_idx - 1:
-                marker.row += amount
-
-
-def prepare_data_rows(ws, count):
-    """
-    Prepara il form per 'count' pezzi in un'unica operazione:
-    - inserisce subito count-1 righe sotto la riga dati del template;
-    - le riempie con stili, segnaposto e formule della riga del template;
-    - corregge le formule di totale sotto la tabella (riga 4 del template)
-      perché coprano tutte le righe.
-    """
-    if count <= 1:
-        return
-
-    first = DATA_START_ROW
-    last = DATA_START_ROW + count - 1
-
-    template_row = snapshot_row(ws, first)
-    insert_rows_keep_layout(ws, first + 1, count - 1)
-
-    for row in range(first + 1, last + 1):
-        fill_row_from_template(ws, template_row, first, row)
-
-    extend_total_formulas(ws, first, last)
-
-
-def find_template_path():
-    """
-    Cerca il template RFQ nella cartella dello script.
-    Ritorna il percorso, oppure None se non trovato.
-    """
-    try:
-        files = os.listdir(BASE_DIR)
-    except Exception:
-        return None
-
-    by_lower = {f.lower(): f for f in files}
-
-    for name in TEMPLATE_CANDIDATES:
-        real = by_lower.get(name.lower())
-        if real:
-            return os.path.join(BASE_DIR, real)
-
-    for f in sorted(files):
-        low = f.lower()
-        if (
-            "rfq" in low and "form" in low
-            and low.endswith((".xlsx", ".xlsm", ".xltx"))
-            and not low.startswith("~$")
-        ):
-            return os.path.join(BASE_DIR, f)
-
-    return None
-
-
-def open_template(template_path):
-    """
-    Apre il template mantenendone il formato.
-    Ritorna (workbook, estensione output).
-    """
-    ext = os.path.splitext(template_path)[1].lower()
-    keep_vba = ext == ".xlsm"
-
-    wb = openpyxl.load_workbook(template_path, keep_vba=keep_vba)
-
-    if ext == ".xltx":
-        # Salva come cartella di lavoro normale, non come modello.
-        wb.template = False
-
-    return wb, (".xlsm" if keep_vba else ".xlsx")
+def get_max_thickness_from_cfg(cfg):
+    for key in ("max_thickness_mm", "thickness_max_mm", "spessore_max_mm"):
+        val = parse_csv_number(cfg_get(cfg, key), "decimal")
+        if val is not None and val > 0:
+            return float(val)
+    return DEFAULT_MAX_THICKNESS_MM
 
 
 # =========================================================================
-# DIAGNOSTICA / REPORT
+# GEOMETRIA BASE
 # =========================================================================
-def log_geometry_report(
-    step_path,
-    body_index,
-    body_count,
-    shapes,
-    original_solids,
-    repaired_solids,
-    used_solids,
-    faces,
-    used_volume,
-    used_surface,
-    thickness,
-    parting,
-    cfg_max_thickness,
-    effective_max_thickness,
-    repair_note,
-    repair_logs,
-):
-    """
-    Scrive un report dettagliato su console e file log.
-    """
-    lines = []
-    lines.append("=" * 80)
-    lines.append(
-        f"REPORT GEOMETRIA | {os.path.basename(step_path)} | "
-        f"Body {body_index}/{body_count}"
-    )
-    lines.append("=" * 80)
-
-    type_counts = {}
-    for sh in shapes:
-        try:
-            st = wrap_occ(sh).ShapeType()
-            name = shape_type_name(st)
-        except Exception:
-            name = "UNKNOWN"
-
-        type_counts[name] = type_counts.get(name, 0) + 1
-
-    lines.append(f"Shapes input: {len(shapes)}")
-    lines.append(f"Tipologie shapes: {type_counts}")
-    lines.append(f"Solidi originali: {len(original_solids)}")
-    lines.append(f"Solidi riparati: {len(repaired_solids)}")
-    lines.append(f"Solidi usati: {len(used_solids)}")
-    lines.append(f"Facce usate: {len(faces)}")
-    lines.append(f"Volume usato: {used_volume:.3f} mm3")
-    lines.append(f"Superficie usata: {used_surface:.3f} mm2")
-    lines.append(f"Metodo spessore: {thickness.method}")
-    lines.append(
-        f"Raggi validi: {thickness.samples}/{thickness.rays} "
-        f"({thickness.coverage:.0%} della superficie)"
-    )
-    lines.append(f"Spessore nominale (mediana): {thickness.nominal:.3f} mm")
-    lines.append(f"Spessore medio: {thickness.mean:.3f} mm")
-    lines.append(
-        f"Spessore P2 / P10 / P90 / P98 / max: "
-        f"{thickness.p2:.3f} / {thickness.p10:.3f} / "
-        f"{thickness.p90:.3f} / {thickness.p98:.3f} / {thickness.max:.3f} mm"
-    )
-    if thickness.histogram:
-        lines.append("Distribuzione spessori (% superficie):")
-        for label, pct in thickness.histogram:
-            lines.append(f"  {label:>16} mm: {pct:5.1f}%")
-    lines.append(f"Max spessore da CSV: {cfg_max_thickness}")
-    lines.append(
-        f"Direzione apertura stampo: {parting.direction} ({parting.source})"
-    )
-    lines.append(
-        f"Area proiettata: {parting.projected_area:.2f} mm2 "
-        f"(contorno esterno, fori inclusi: {parting.contour_area:.2f} mm2) "
-        f"| metodo: {parting.method}"
-    )
-    for c in parting.candidates:
-        uc = "n.d." if c.undercut_pct is None else f"{c.undercut_pct:5.1f}%"
-        lines.append(
-            f"  {c.name:<40} area proiettata {c.projected_area:12.2f} mm2 "
-            f"| sottosquadri {uc} superficie"
-        )
-    lines.append(f"Max spessore effettivo: {effective_max_thickness}")
-    lines.append(f"Nota repair: {repair_note}")
-
-    if repair_logs:
-        lines.append("-" * 80)
-        for entry in repair_logs:
-            lines.append(f"REPAIR | {entry}")
-
-    if used_volume <= 0.0:
-        lines.append("-" * 80)
-        lines.append("WARNING: volume = 0. Possibili cause:")
-        lines.append("  - STEP contiene superfici/facce e non solidi")
-        lines.append("  - shell non chiusa")
-        lines.append("  - geometria corrotta o non cucita")
-        lines.append("  - modello non valido per calcolo volumetrico")
-
-    if used_surface <= 0.0:
-        lines.append("WARNING: superficie = 0. Non posso stimare lo spessore globale.")
-
-    lines.append("=" * 80)
-
-    text = "\n".join(lines)
-
-    if DEBUG_GEOMETRY:
-        logger.info(text)
+def occ(shape):
+    """Oggetto OCCT sottostante a una shape CadQuery."""
+    return getattr(shape, "wrapped", shape)
 
 
-# =========================================================================
-# REPAIR GEOMETRICO
-# =========================================================================
-def fix_occ_shape(wrapped, tol=1e-4):
-    """
-    Prova a riparare una shape con ShapeFix.
-    Ritorna la shape riparata, o quella originale se fallisce.
-    """
-    if wrapped is None:
-        return None
+def signed_volume(wrapped):
+    """Volume con segno: negativo se il solido è orientato al contrario."""
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(wrapped, props)
+    return float(props.Mass())
 
+
+def volume(shape):
     try:
-        if wrapped.IsNull():
-            return wrapped
+        return abs(signed_volume(occ(shape)))
     except Exception:
-        pass
+        return 0.0
 
+
+def surface_area(shape):
     try:
-        try:
-            fix = ShapeFix_Shape(wrapped)
-        except TypeError:
-            fix = ShapeFix_Shape()
-            fix.Init(wrapped)
-
-        try:
-            fix.SetMaxTolerance(tol)
-        except Exception:
-            pass
-
-        fix.Perform()
-        out = fix.Shape()
-
-        if out is not None:
-            try:
-                if not out.IsNull():
-                    return out
-            except Exception:
-                return out
+        props = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(occ(shape), props)
+        return abs(float(props.Mass()))
     except Exception:
-        pass
-
-    return wrapped
+        return 0.0
 
 
-def sew_occ_shapes(wrapped_list, tol=1e-4):
-    """
-    Prova a cucire più shape in una shell/compound più sano.
-    """
-    try:
-        sewing = BRepBuilderAPI_Sewing(tol)
-        added = False
+def combine_shapes(shapes):
+    return shapes[0] if len(shapes) == 1 else cq.Compound.makeCompound(shapes)
 
-        for w in wrapped_list:
-            if w is None:
-                continue
 
-            try:
-                if w.IsNull():
-                    continue
-            except Exception:
-                pass
-
-            try:
-                sewing.Add(w)
-                added = True
-            except Exception:
-                continue
-
-        if not added:
-            return None
-
-        sewing.Perform()
-        out = sewing.SewedShape()
-
-        if out is not None:
-            try:
-                if not out.IsNull():
-                    return out
-            except Exception:
-                return out
-
-        return None
-    except Exception:
-        return None
+def collect_solids(shapes):
+    return [s for sh in shapes for s in sh.Solids()]
 
 
 def explore_shapes_by_type(wrapped, shape_type):
-    """
-    Estrae tutte le sotto-shape di un certo tipo usando TopExp_Explorer.
-    """
     result = []
-
-    if wrapped is None:
-        return result
-
-    try:
-        if wrapped.IsNull():
-            return result
-    except Exception:
-        pass
-
-    try:
-        exp = TopExp_Explorer(wrapped, shape_type)
-        while exp.More():
-            cur = exp.Current()
-            try:
-                if cur is not None and not cur.IsNull():
-                    result.append(cur)
-            except Exception:
-                result.append(cur)
-            exp.Next()
-    except Exception:
-        pass
-
+    exp = TopExp_Explorer(wrapped, shape_type)
+    while exp.More():
+        result.append(exp.Current())
+        exp.Next()
     return result
 
 
-def cast_to_topods_shell(shell_occ):
-    """
-    Prova a convertire una shape in TopoDS_Shell in modo robusto.
-    """
-    for fn_name in ("Shell_s", "Shell"):
-        fn = getattr(TopoDS, fn_name, None)
-        if callable(fn):
-            try:
-                return fn(shell_occ)
-            except Exception:
-                pass
+def bounding_box(shapes):
+    """Ingombro (SimpleNamespace con min/max e xlen, ylen, zlen) o None."""
+    bbox = Bnd_Box()
+    for sh in shapes:
+        BRepBndLib.Add_s(occ(sh), bbox, False)
 
-    try:
-        from OCP.TopoDS import topods
-        if hasattr(topods, "Shell"):
-            return topods.Shell(shell_occ)
-    except Exception:
-        pass
-
-    return None
-
-
-def make_solid_from_shell_occ(shell_occ, tol=1e-4):
-    """
-    Prova a trasformare una shell in solido.
-    Prima ripara la shell, poi usa BRepBuilderAPI_MakeSolid.
-    """
-    if shell_occ is None:
+    if bbox.IsVoid():
         return None
 
-    fixed = fix_occ_shape(shell_occ, tol)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    return SimpleNamespace(
+        xmin=xmin, ymin=ymin, zmin=zmin,
+        xmax=xmax, ymax=ymax, zmax=zmax,
+        xlen=xmax - xmin, ylen=ymax - ymin, zlen=zmax - zmin,
+    )
 
-    shells = explore_shapes_by_type(fixed, TopAbs_SHELL)
 
-    if not shells and fixed is not None:
+def bbox_diagonal(shapes):
+    bb = bounding_box(shapes)
+    if bb is None:
+        return 100.0
+    return math.sqrt(bb.xlen ** 2 + bb.ylen ** 2 + bb.zlen ** 2)
+
+
+# =========================================================================
+# REPAIR GEOMETRICO (STEP con superfici/shell invece di solidi)
+# =========================================================================
+def fix_occ_shape(wrapped, tol):
+    try:
+        fix = ShapeFix_Shape(wrapped)
+        fix.SetMaxTolerance(tol)
+        fix.Perform()
+        out = fix.Shape()
+        return wrapped if out.IsNull() else out
+    except Exception:
+        return wrapped
+
+
+def make_solid_from_shell(shell, tol):
+    """Shell (riparata) -> solido, oppure None."""
+    for sh in explore_shapes_by_type(fix_occ_shape(shell, tol), TopAbs_SHELL):
         try:
-            if fixed.ShapeType() == TopAbs_SHELL:
-                shells = [fixed]
-        except Exception:
-            pass
-
-    for sh in shells:
-        top_shell = cast_to_topods_shell(sh)
-        if top_shell is None:
-            continue
-
-        try:
-            mk = BRepBuilderAPI_MakeSolid(top_shell)
-            if not mk.IsDone():
-                continue
-
-            solid = mk.Solid()
-            if solid is None:
-                continue
-
-            try:
-                if solid.IsNull():
-                    continue
-            except Exception:
-                pass
-
-            solid = fix_occ_shape(solid, tol)
-            if solid is not None:
-                return solid
+            mk = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sh))
+            if mk.IsDone():
+                return fix_occ_shape(mk.Solid(), tol)
         except Exception:
             continue
-
     return None
 
 
-def try_repair_to_solids(top_shapes, tol=1e-4):
+def try_repair_to_solids(shapes, tol):
     """
-    Prova a ottenere solidi validi partendo dalle shape importate.
-
-    Strategia:
-    1. ShapeFix sulle shape originali
-    2. ricerca solidi già presenti
-    3. sewing delle shape
-    4. ricerca solidi nel risultato cucito
-    5. conversione shell -> solido
+    Solidi validi dalle shape importate:
+    ShapeFix -> solidi già presenti -> sewing -> shell cucite -> solidi.
     """
     solids = []
     seen = set()
-    repaired_shapes = []
-    fixed_wrapped = []
 
-    def add_solid_occ(sol_occ):
-        if sol_occ is None:
+    def add(sol):
+        if sol is None or sol.IsNull():
             return
-
-        try:
-            if sol_occ.IsNull():
-                return
-        except Exception:
-            pass
-
-        sig = occ_signature(sol_occ)
-        if sig in seen:
+        vol = volume(sol)
+        if vol <= 0.0:
             return
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(sol, props)
+        c = props.CentreOfMass()
+        sig = (round(vol, 6), round(c.X(), 3), round(c.Y(), 3), round(c.Z(), 3))
+        if sig not in seen:
+            seen.add(sig)
+            solids.append(cq.Shape.cast(sol))
 
-        cq_obj = wrap_cq(sol_occ)
-        if cq_obj is None:
-            return
+    def add_solids_in(wrapped):
+        for kind in (TopAbs_SOLID, TopAbs_COMPSOLID):
+            for sol in explore_shapes_by_type(wrapped, kind):
+                add(sol)
 
-        if safe_volume(cq_obj) <= 0.0:
-            return
-
-        seen.add(sig)
-        solids.append(cq_obj)
-
-    # 1. Fix iniziale
-    for s in top_shapes:
-        w = wrap_occ(s)
-        if w is None:
-            continue
-
-        fixed = fix_occ_shape(w, tol)
-        fixed_wrapped.append(fixed)
-        repaired_shapes.append(wrap_cq(fixed) or s)
-
-    # 2. Solidi già presenti dopo fix
-    for w in fixed_wrapped:
-        for sol in explore_shapes_by_type(w, TopAbs_SOLID):
-            add_solid_occ(sol)
-
-        for sol in explore_shapes_by_type(w, TopAbs_COMPSOLID):
-            add_solid_occ(sol)
-
+    fixed = [fix_occ_shape(occ(s), tol) for s in shapes]
+    for w in fixed:
+        add_solids_in(w)
     if solids:
-        return solids, repaired_shapes
+        return solids
 
-    # 3. Sewing
-    sewed = sew_occ_shapes(fixed_wrapped, tol)
-    if sewed is not None:
-        repaired_shapes.append(wrap_cq(sewed))
+    sewing = BRepBuilderAPI_Sewing(tol)
+    for w in fixed:
+        sewing.Add(w)
+    sewing.Perform()
+    sewed = sewing.SewedShape()
 
-        for sol in explore_shapes_by_type(sewed, TopAbs_SOLID):
-            add_solid_occ(sol)
-
-        for sol in explore_shapes_by_type(sewed, TopAbs_COMPSOLID):
-            add_solid_occ(sol)
-
+    if not sewed.IsNull():
+        add_solids_in(sewed)
         if solids:
-            return solids, repaired_shapes
-
-        # 4/5. Shell cucite -> solidi
+            return solids
         for shell in explore_shapes_by_type(sewed, TopAbs_SHELL):
-            solid = make_solid_from_shell_occ(shell, tol)
-            add_solid_occ(solid)
-
+            add(make_solid_from_shell(shell, tol))
         if solids:
-            return solids, repaired_shapes
+            return solids
 
-    # 5. Shell residue senza sewing globale
-    for w in fixed_wrapped:
+    for w in fixed:
         for shell in explore_shapes_by_type(w, TopAbs_SHELL):
-            solid = make_solid_from_shell_occ(shell, tol)
-            add_solid_occ(solid)
-
+            add(make_solid_from_shell(shell, tol))
         if solids:
             break
 
-    return solids, repaired_shapes
+    return solids
 
 
-def try_repair_to_solids_multi(top_shapes, tolerances=None):
-    """
-    Prova il repair con più tolleranze, in modo progressivo.
-    Ritorna:
-    - lista migliori di solidi trovati
-    - log dei tentativi
-    """
-    if tolerances is None:
-        tolerances = REPAIR_TOLERANCES
+def repair_to_solids(shapes):
+    """Repair con tutte le tolleranze; tiene il risultato con volume maggiore."""
+    best, best_volume, logs = [], 0.0, []
 
-    best_solids = []
-    best_volume = 0.0
-    logs = []
-
-    for tol in tolerances:
+    for tol in REPAIR_TOLERANCES:
         try:
-            solids, _ = try_repair_to_solids(top_shapes, tol=tol)
-            vol = sum(safe_volume(s) for s in solids)
-
-            logs.append(
-                f"tol={tol:.0e} -> solidi={len(solids)}, volume={vol:.6f}"
-            )
-
+            solids = try_repair_to_solids(shapes, tol)
+            vol = sum(volume(s) for s in solids)
+            logs.append(f"tol={tol:.0e} -> solidi={len(solids)}, volume={vol:.6f}")
             if vol > best_volume:
-                best_volume = vol
-                best_solids = solids
-
+                best, best_volume = solids, vol
         except Exception as e:
             logs.append(f"tol={tol:.0e} -> errore: {e}")
 
-    return best_solids, logs
+    return best, logs
 
 
 # =========================================================================
-# SPESSORE PARETI (RAY-CASTING)
+# CAMPIONAMENTO SUPERFICIE E RAGGI
 # =========================================================================
-#
-# Metodo:
-# 1. si campionano N punti distribuiti uniformemente sulla superficie del
-#    solido (ogni punto rappresenta la stessa area);
-# 2. da ogni punto si lancia un raggio verso l'interno, lungo la normale
-#    esatta della superficie;
-# 3. la distanza dalla prima parete incontrata è lo spessore locale;
-# 4. il campione è valido solo se la parete d'uscita è "opposta" (la sua
-#    normale è quasi parallela al raggio): così si scartano i raggi che
-#    entrano in una parete laterale invece di attraversare il materiale;
-# 5. controllo "sfera inscritta": si misura il diametro della sfera più
-#    grande centrata a metà raggio. Se è molto più piccolo del raggio,
-#    il raggio ha corso lungo una parete invece di attraversarla (es.
-#    partito dal fianco stretto di una lastra, o dal fondo sotto una
-#    nervatura) e il campione viene scartato. Senza questo controllo i
-#    fianchi gonfierebbero media e massimo.
-#
-# Poiché i punti sono pesati sull'area, la mediana dei campioni è lo
-# spessore nominale "della maggior parte del pezzo", poco sensibile a
-# nervature, borchie e zone massive locali.
-
-THICKNESS_HISTOGRAM_EDGES = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0,
-    float("inf"),
-]
-
-
 def _vec_norm(x, y, z):
     length = math.sqrt(x * x + y * y + z * z)
     if length < 1e-12:
@@ -1477,10 +572,26 @@ def _vec_norm(x, y, z):
     return (x / length, y / length, z / length)
 
 
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
 def face_normal_at(evaluator, u, v):
     """
-    Punto e normale (uscente, unitaria) di una faccia nei parametri (u, v).
-    BRepGProp_Face tiene conto dell'orientamento della faccia nel solido.
+    Punto e normale unitaria di una faccia in (u, v). BRepGProp_Face tiene
+    conto dell'orientamento della faccia nel solido (normale uscente).
     """
     pnt = gp_Pnt()
     nrm = gp_Vec()
@@ -1489,50 +600,15 @@ def face_normal_at(evaluator, u, v):
     n = _vec_norm(nrm.X(), nrm.Y(), nrm.Z())
     if n is None:
         return None, None
-
     return (pnt.X(), pnt.Y(), pnt.Z()), n
-
-
-def make_shells_compound(solid_occ):
-    """
-    Compound con le shell del solido: serve per la distanza punto-superficie
-    (con il solido, un punto interno avrebbe distanza 0).
-    """
-    comp = TopoDS_Compound()
-    builder = BRep_Builder()
-    builder.MakeCompound(comp)
-
-    for shell in explore_shapes_by_type(solid_occ, TopAbs_SHELL):
-        builder.Add(comp, shell)
-
-    return comp
-
-
-def distance_to_surface(point, surface_occ):
-    """Distanza minima tra un punto e la superficie del solido."""
-    vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
-    dist = BRepExtrema_DistShapeShape(vertex, surface_occ)
-    if not dist.IsDone():
-        return None
-    return float(dist.Value())
-
-
-def to_topods_face(shape):
-    """Converte una TopoDS_Shape in TopoDS_Face."""
-    fn = getattr(TopoDS, "Face_s", None) or getattr(TopoDS, "Face")
-    return fn(shape)
 
 
 def sample_surface_points(solid_occ, count, rng, mesh_tol):
     """
-    Campiona 'count' punti distribuiti uniformemente sulla superficie.
-
-    La triangolazione serve solo a sapere DOVE campionare (scelta dei
-    triangoli pesata sull'area): le coordinate UV del punto vengono
-    interpolate dai nodi UV del triangolo, poi punto e normale vengono
-    valutati sulla superficie esatta, senza errori di discretizzazione.
-
-    Ritorna una lista di (punto, normale_uscente).
+    'count' punti distribuiti uniformemente sulla superficie, come
+    (punto, normale). La triangolazione serve solo a scegliere DOVE
+    campionare (triangoli pesati sull'area): punto e normale sono valutati
+    sulla superficie esatta dalle coordinate UV interpolate.
     """
     BRepMesh_IncrementalMesh(solid_occ, mesh_tol, False, 0.5, True)
 
@@ -1540,12 +616,8 @@ def sample_surface_points(solid_occ, count, rng, mesh_tol):
     weights = []
 
     for face_shape in explore_shapes_by_type(solid_occ, TopAbs_FACE):
-        try:
-            face = to_topods_face(face_shape)
-            poly = BRep_Tool.Triangulation_s(face, TopLoc_Location())
-        except Exception:
-            continue
-
+        face = TopoDS.Face_s(face_shape)
+        poly = BRep_Tool.Triangulation_s(face, TopLoc_Location())
         if poly is None or not poly.HasUVNodes():
             continue
 
@@ -1555,21 +627,14 @@ def sample_surface_points(solid_occ, count, rng, mesh_tol):
             n1, n2, n3 = poly.Triangle(i).Get()
             p1, p2, p3 = poly.Node(n1), poly.Node(n2), poly.Node(n3)
 
-            ax, ay, az = p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z()
-            bx, by, bz = p3.X() - p1.X(), p3.Y() - p1.Y(), p3.Z() - p1.Z()
-            area = 0.5 * math.sqrt(
-                (ay * bz - az * by) ** 2
-                + (az * bx - ax * bz) ** 2
-                + (ax * by - ay * bx) ** 2
-            )
+            a = (p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z())
+            b = (p3.X() - p1.X(), p3.Y() - p1.Y(), p3.Z() - p1.Z())
+            area = 0.5 * math.sqrt(sum(c * c for c in _cross(a, b)))
             if area <= 1e-12:
                 continue
 
             uvs = [poly.UVNode(k) for k in (n1, n2, n3)]
-            triangles.append((
-                evaluator,
-                [(uv.X(), uv.Y()) for uv in uvs],
-            ))
+            triangles.append((evaluator, [(uv.X(), uv.Y()) for uv in uvs]))
             weights.append(area)
 
     if not triangles:
@@ -1591,47 +656,69 @@ def sample_surface_points(solid_occ, count, rng, mesh_tol):
             p, n = face_normal_at(evaluator, u, v)
         except Exception:
             continue
-
         if p is not None:
             points.append((p, n))
 
     return points
 
 
+def make_intersector(wrapped):
+    intersector = IntCurvesFace_ShapeIntersector()
+    intersector.Load(wrapped, 1e-6)
+    return intersector
+
+
+# =========================================================================
+# SPESSORE PARETI (RAY-CASTING)
+# =========================================================================
+#
+# 1. N punti distribuiti uniformemente sulla superficie (stessa area
+#    ciascuno);
+# 2. da ogni punto un raggio verso l'interno lungo la normale esatta;
+# 3. la distanza dalla prima parete incontrata è lo spessore locale;
+# 4. valido solo se la parete d'uscita è "opposta" (normale quasi
+#    parallela al raggio): si scartano i raggi entrati in pareti laterali;
+# 5. controllo "sfera inscritta" a metà raggio: se il diametro è molto più
+#    piccolo del raggio, il raggio ha corso lungo una parete (es. partito
+#    dal fianco stretto di una lastra) e il campione è scartato.
+#
+# La mediana dei campioni (pesati sull'area) è lo spessore nominale,
+# poco sensibile a nervature, borchie e zone massive locali.
+
+def make_shells_compound(solid_occ):
+    """Shell del solido: per la distanza punto-superficie (con il solido
+    un punto interno avrebbe distanza 0)."""
+    comp = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(comp)
+    for shell in explore_shapes_by_type(solid_occ, TopAbs_SHELL):
+        builder.Add(comp, shell)
+    return comp
+
+
+def distance_to_surface(point, surface_occ):
+    vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
+    dist = BRepExtrema_DistShapeShape(vertex, surface_occ)
+    return float(dist.Value()) if dist.IsDone() else None
+
+
 def measure_wall_thickness(solid, max_thickness, ray_count):
-    """
-    Misura lo spessore locale di un solido con ray-casting.
-    Ritorna (lista spessori validi, numero raggi lanciati).
-    """
-    wrapped = wrap_occ(solid)
-    if wrapped is None:
+    """Spessori locali validi di un solido e numero di raggi lanciati."""
+    wrapped = occ(solid)
+    vol = signed_volume(wrapped)
+    if vol == 0.0:
         return [], 0
 
-    try:
-        if wrapped.ShapeType() not in (TopAbs_SOLID, TopAbs_COMPSOLID):
-            return [], 0
-        vol = signed_volume(wrapped)
-    except Exception:
-        return [], 0
-
-    if abs(vol) <= 0.0:
-        return [], 0
-
-    # Solido orientato al contrario: le normali puntano verso l'interno.
+    # Solido orientato al contrario: normali verso l'interno.
     orientation = -1.0 if vol < 0 else 1.0
 
-    diag = bbox_diagonal([solid])
-    mesh_tol = min(max(diag * 2e-3, 0.01), 1.0)
-
-    rng = random.Random(THICKNESS_RANDOM_SEED)
-    points = sample_surface_points(wrapped, ray_count, rng, mesh_tol)
+    mesh_tol = min(max(bbox_diagonal([solid]) * 2e-3, 0.01), 1.0)
+    points = sample_surface_points(wrapped, ray_count, random.Random(RANDOM_SEED), mesh_tol)
     if not points:
         return [], 0
 
-    intersector = IntCurvesFace_ShapeIntersector()
-    intersector.Load(wrapped, 1e-6)
+    intersector = make_intersector(wrapped)
     surface = make_shells_compound(wrapped)
-
     cos_limit = math.cos(math.radians(THICKNESS_MAX_EXIT_ANGLE_DEG))
     samples = []
 
@@ -1639,18 +726,12 @@ def measure_wall_thickness(solid, max_thickness, ray_count):
         d = (-n[0] * orientation, -n[1] * orientation, -n[2] * orientation)
 
         try:
-            line = gp_Lin(gp_Pnt(*p), gp_Dir(*d))
-            intersector.Perform(line, THICKNESS_MIN_MM, max_thickness)
-
+            intersector.Perform(gp_Lin(gp_Pnt(*p), gp_Dir(*d)), THICKNESS_MIN_MM, max_thickness)
             if not intersector.IsDone() or intersector.NbPnt() == 0:
                 continue
 
-            hit = min(
-                range(1, intersector.NbPnt() + 1),
-                key=intersector.WParameter,
-            )
+            hit = min(range(1, intersector.NbPnt() + 1), key=intersector.WParameter)
             dist = intersector.WParameter(hit)
-
             _, hit_n = face_normal_at(
                 BRepGProp_Face(intersector.Face(hit)),
                 intersector.UParameter(hit),
@@ -1659,27 +740,16 @@ def measure_wall_thickness(solid, max_thickness, ray_count):
         except Exception:
             continue
 
-        if hit_n is None:
-            continue
-
         # La parete d'uscita deve guardare nella stessa direzione del raggio.
-        cos_exit = orientation * (
-            hit_n[0] * d[0] + hit_n[1] * d[1] + hit_n[2] * d[2]
-        )
-        if cos_exit < cos_limit:
+        if hit_n is None or orientation * _dot(hit_n, d) < cos_limit:
             continue
 
         # Sfera inscritta centrata a metà raggio.
-        mid = (
-            p[0] + d[0] * dist * 0.5,
-            p[1] + d[1] * dist * 0.5,
-            p[2] + d[2] * dist * 0.5,
-        )
+        mid = tuple(p[k] + d[k] * dist * 0.5 for k in range(3))
         try:
             radius = distance_to_surface(mid, surface)
         except Exception:
             radius = None
-
         if radius is not None and 2.0 * radius < THICKNESS_SPHERE_RATIO * dist:
             continue
 
@@ -1690,9 +760,6 @@ def measure_wall_thickness(solid, max_thickness, ray_count):
 
 def percentile(sorted_values, q):
     """Percentile con interpolazione lineare (q tra 0 e 100)."""
-    if not sorted_values:
-        return 0.0
-
     pos = (len(sorted_values) - 1) * q / 100.0
     lo = int(math.floor(pos))
     hi = min(lo + 1, len(sorted_values) - 1)
@@ -1700,60 +767,41 @@ def percentile(sorted_values, q):
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
 
 
-def thickness_histogram(sorted_values):
-    """Distribuzione percentuale (sulla superficie) per classi di spessore."""
-    total = len(sorted_values)
-    if not total:
-        return []
-
+def thickness_histogram(values):
+    """Percentuale di superficie per classe di spessore."""
     result = []
     edges = THICKNESS_HISTOGRAM_EDGES
     for lo, hi in zip(edges[:-1], edges[1:]):
         # Tolleranza: 3.0 misurato come 2.9999999 resta nella classe 3-4.
-        cnt = sum(1 for x in sorted_values if lo <= x + 1e-6 < hi)
+        cnt = sum(1 for x in values if lo <= x + 1e-6 < hi)
         if cnt:
             label = f">= {lo:g}" if math.isinf(hi) else f"{lo:g} - {hi:g}"
-            result.append((label, 100.0 * cnt / total))
-
+            result.append((label, 100.0 * cnt / len(values)))
     return result
 
 
-def compute_wall_thickness(
-    solids,
-    fallback_volume,
-    fallback_surface,
-    max_thickness,
-):
+def compute_wall_thickness(solids, fallback_volume, fallback_surface, max_thickness):
     """
-    Statistiche di spessore del corpo.
-
-    Priorità:
-    1. ray-casting sui solidi
-    2. fallback globale 2V/S (esatto solo per lastre sottili)
-
-    Ritorna un SimpleNamespace con: method, nominal (mediana), mean,
-    p2, p10, p90, p98, max, samples, rays, coverage, histogram.
-    I percentili sono sulla superficie: p98 = 98% della superficie ha
-    spessore inferiore (massimo robusto, senza i singoli raggi anomali).
+    Statistiche di spessore: ray-casting sui solidi, altrimenti stima
+    globale 2V/S (esatta solo per lastre sottili). I percentili sono sulla
+    superficie: p98 = 98% della superficie ha spessore inferiore.
     """
     samples = []
     rays = 0
 
-    if solids:
-        areas = [max(safe_surface_area(s), 0.0) for s in solids]
-        total_area = sum(areas) or 1.0
+    areas = [surface_area(s) for s in solids]
+    total_area = sum(areas) or 1.0
 
-        for s, area in zip(solids, areas):
-            # Raggi distribuiti tra i solidi in proporzione alla superficie.
-            count = max(200, int(round(THICKNESS_RAY_COUNT * area / total_area)))
-            try:
-                s_samples, s_rays = measure_wall_thickness(s, max_thickness, count)
-            except Exception as e:
-                logger.warning(f"Misura spessore fallita su un solido: {e}")
-                continue
-
-            samples.extend(s_samples)
-            rays += s_rays
+    for s, area in zip(solids, areas):
+        # Raggi distribuiti tra i solidi in proporzione alla superficie.
+        count = max(200, int(round(THICKNESS_RAY_COUNT * area / total_area)))
+        try:
+            s_samples, s_rays = measure_wall_thickness(s, max_thickness, count)
+        except Exception as e:
+            logger.warning(f"Misura spessore fallita su un solido: {e}")
+            continue
+        samples.extend(s_samples)
+        rays += s_rays
 
     if samples:
         values = sorted(samples)
@@ -1768,181 +816,91 @@ def compute_wall_thickness(
             max=values[-1],
             samples=len(values),
             rays=rays,
-            coverage=len(values) / rays if rays else 0.0,
             histogram=thickness_histogram(values),
         )
 
-    value = (2.0 * fallback_volume / fallback_surface) if fallback_surface > 0 else 0.0
-    value = float(value)
+    value = 2.0 * fallback_volume / fallback_surface if fallback_surface > 0 else 0.0
     return SimpleNamespace(
-        method="global_estimate_2V/S",
-        nominal=value,
-        mean=value,
-        p2=value,
-        p10=value,
-        p90=value,
-        p98=value,
-        max=value,
-        samples=0,
-        rays=rays,
-        coverage=0.0,
-        histogram=[],
+        method="stima globale 2V/S",
+        nominal=value, mean=value, p2=value, p10=value, p90=value, p98=value, max=value,
+        samples=0, rays=rays, histogram=[],
     )
 
 
 # =========================================================================
-# DIREZIONE DI SFORMO E AREA PROIETTATA
+# DIREZIONE DI APERTURA E AREA PROIETTATA
 # =========================================================================
 #
-# Area proiettata = area dell'"ombra" del pezzo su un piano perpendicolare
-# alla direzione di apertura dello stampo: è l'area su cui agisce la
-# pressione in cavità, quindi determina la forza di chiusura.
+# Area proiettata = "ombra" del pezzo sul piano perpendicolare alla
+# direzione di apertura (area su cui agisce la pressione in cavità, quindi
+# forza di chiusura): unione geometrica delle proiezioni dei triangoli
+# della mesh rivolti verso l'apertura. Le zone sovrapposte contano una
+# sola volta, i fori passanti restano esclusi.
 #
-# Calcolo: i triangoli della mesh rivolti verso la direzione di apertura
-# vengono proiettati sul piano e se ne fa l'UNIONE geometrica (shapely).
-# Le zone sovrapposte (es. fondo e bordo di una scatola, nervature sopra
-# il fondo) contano una sola volta e i fori passanti restano esclusi.
-# Senza shapely si usa una griglia di raggi paralleli alla direzione
-# (più lenta e approssimata sul contorno).
-#
-# Direzione di apertura: per ogni direzione candidata (X, Y, Z e assi
-# principali d'inerzia) da punti campionati sulla superficie si lancia un
-# raggio nel verso in cui quel punto si sforma (+d o -d secondo la
-# normale). Se il raggio colpisce di nuovo il pezzo, il punto è in
-# sottosquadro. Vince la direzione con meno area in sottosquadro; a pari
-# merito (es. una lastra, sformabile in tutte e tre le direzioni) quella
-# con area proiettata maggiore, cioè il pezzo "steso" nello stampo.
-# La direzione si può forzare dal CSV con la colonna 'parting_direction'
-# (valori X, Y o Z).
-
-try:
-    from shapely.geometry import Polygon
-    from shapely.ops import unary_union
-except Exception:
-    Polygon = None
-    unary_union = None
-
-# Punti campionati per l'analisi sottosquadri (per direzione).
-PARTING_RAY_COUNT = 2000
-# Facce entro questo angolo dalla direzione di apertura sono pareti
-# parallele all'apertura (senza sformo), non sottosquadri.
-PARTING_NEUTRAL_DEG = 0.5
-# Differenza di area in sottosquadro (frazione della superficie) entro cui
-# due direzioni sono considerate equivalenti.
-PARTING_TIE_REL = 0.005
-# Deflessione mesh relativa alla diagonale bbox, limitata a [0.005, 0.05] mm.
-PROJECTION_MESH_TOL_REL = 2e-4
-# Risoluzione della griglia di raggi usata se shapely non è installato.
-PROJECTION_GRID_SIZE = 150
-
-AXIS_DIRECTIONS = {
-    "X": (1.0, 0.0, 0.0),
-    "Y": (0.0, 1.0, 0.0),
-    "Z": (0.0, 0.0, 1.0),
-}
-
-
-def _dot(a, b):
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-
-def _cross(a, b):
-    return (
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    )
-
-
-def _sub(a, b):
-    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
+# Direzione: per X, Y, Z e gli assi principali d'inerzia, da punti
+# campionati sulla superficie si lancia un raggio nel verso in cui il punto
+# si sforma (+d o -d secondo la normale); se colpisce di nuovo il pezzo il
+# punto è in sottosquadro. Vince la direzione con meno sottosquadri; a
+# pari merito (es. una lastra) quella con area proiettata maggiore.
+# Si può forzare dal CSV con la colonna 'parting_direction' (X, Y o Z).
 
 def plane_basis(d):
     """Due versori ortogonali tra loro e alla direzione d."""
     helper = (1.0, 0.0, 0.0) if abs(d[0]) < 0.9 else (0.0, 1.0, 0.0)
     u = _vec_norm(*_cross(d, helper))
-    v = _cross(d, u)
-    return u, v
+    return u, _cross(d, u)
 
 
 def parse_parting_direction(cfg):
-    """Direzione di apertura forzata dal CSV ('X', '>Z', '-y', ...), o None."""
-    for key in ("parting_direction", "opening_direction", "draw_direction"):
-        txt = str(cfg_get(cfg, key, "")).strip().upper()
-        letters = [ch for ch in txt if ch in AXIS_DIRECTIONS]
-        if letters:
-            return letters[0]
-    return None
+    """Direzione forzata dal CSV ('X', '>Z', '-y', ...) o None."""
+    letters = [ch for ch in str(cfg_get(cfg, "parting_direction")).upper() if ch in AXIS_DIRECTIONS]
+    return letters[0] if letters else None
 
 
 def candidate_directions(solids):
     """Assi X, Y, Z più gli assi principali d'inerzia non già inclusi."""
     cands = list(AXIS_DIRECTIONS.items())
 
-    try:
-        props = gprop_call(
-            "VolumeProperties", wrap_occ(combine_shapes(solids)), GProp_GProps()
-        )
-        pp = props.PrincipalProperties()
-        axes = [
-            pp.FirstAxisOfInertia(),
-            pp.SecondAxisOfInertia(),
-            pp.ThirdAxisOfInertia(),
-        ]
-    except Exception:
-        axes = []
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(occ(combine_shapes(solids)), props)
+    pp = props.PrincipalProperties()
+    axes = [pp.FirstAxisOfInertia(), pp.SecondAxisOfInertia(), pp.ThirdAxisOfInertia()]
 
     for i, ax in enumerate(axes, start=1):
         vec = _vec_norm(ax.X(), ax.Y(), ax.Z())
-        if vec is None:
+        if vec is None or any(abs(_dot(vec, c)) > 0.999 for _, c in cands):
             continue
-        if any(abs(_dot(vec, c)) > 0.999 for _, c in cands):
-            continue
-        name = f"inerzia {i} ({vec[0]:+.2f}, {vec[1]:+.2f}, {vec[2]:+.2f})"
-        cands.append((name, vec))
+        cands.append((f"inerzia {i} ({vec[0]:+.2f}, {vec[1]:+.2f}, {vec[2]:+.2f})", vec))
 
     return cands
 
 
 def shape_triangles(shape, mesh_tol, outward):
     """
-    Triangoli della mesh in coordinate globali.
-    Con outward=True la normale (p2-p1)x(p3-p1) punta fuori dal solido.
+    Triangoli della mesh in coordinate globali; con outward=True la
+    normale (p2-p1)x(p3-p1) punta fuori dal solido.
     """
-    # Elimina la mesh esistente (es. quella grossolana del calcolo spessori),
-    # altrimenti tessellate() la riusa invece di rifarla alla tolleranza data.
-    BRepTools.Clean_s(wrap_occ(shape))
+    # Senza Clean, tessellate() riuserebbe la mesh grossolana dello spessore.
+    BRepTools.Clean_s(occ(shape))
     verts, tris = shape.tessellate(mesh_tol, 0.1)
     pts = [(p.x, p.y, p.z) for p in verts]
 
-    flip = False
-    if outward:
-        try:
-            flip = signed_volume(wrap_occ(shape)) < 0
-        except Exception:
-            pass
-
-    result = []
-    for a, b, c in tris:
-        if flip:
-            b, c = c, b
-        result.append((pts[a], pts[b], pts[c]))
-    return result
+    flip = outward and signed_volume(occ(shape)) < 0
+    return [
+        (pts[a], pts[c], pts[b]) if flip else (pts[a], pts[b], pts[c])
+        for a, b, c in tris
+    ]
 
 
-def silhouette_area_polygons(triangles, d, front_only):
-    """
-    Area esatta (a meno della mesh) della proiezione lungo d.
-    Ritorna (area netta, area contorno esterno con i fori riempiti).
-    """
+def silhouette_area(triangles, d, front_only):
+    """Area netta della proiezione lungo d e area del contorno esterno
+    (fori riempiti)."""
     u, v = plane_basis(d)
     polys = []
 
     for p1, p2, p3 in triangles:
         if front_only and _dot(_cross(_sub(p2, p1), _sub(p3, p1)), d) <= 0.0:
             continue
-
         poly = Polygon([(_dot(p, u), _dot(p, v)) for p in (p1, p2, p3)])
         if poly.area > 1e-9:
             polys.append(poly)
@@ -1956,54 +914,9 @@ def silhouette_area_polygons(triangles, d, front_only):
     return float(union.area), float(contour)
 
 
-def silhouette_area_grid(shape_occ, intersector, d):
-    """
-    Area della proiezione lungo d contando quanti raggi paralleli a d,
-    su una griglia regolare, colpiscono il pezzo (fallback senza shapely).
-    """
-    bb = safe_bounding_box([shape_occ])
-    if bb is None:
-        return 0.0, 0.0
-
-    u, v = plane_basis(d)
-    corners = [
-        (x, y, z)
-        for x in (bb.xmin, bb.xmax)
-        for y in (bb.ymin, bb.ymax)
-        for z in (bb.zmin, bb.zmax)
-    ]
-    us = [_dot(c, u) for c in corners]
-    vs = [_dot(c, v) for c in corners]
-    ws_ = [_dot(c, d) for c in corners]
-
-    n = PROJECTION_GRID_SIZE
-    du = (max(us) - min(us)) / n
-    dv = (max(vs) - min(vs)) / n
-    w0 = min(ws_) - 1.0
-    length = max(ws_) - w0 + 1.0
-
-    hits = 0
-    for i in range(n):
-        a = min(us) + (i + 0.5) * du
-        for j in range(n):
-            b = min(vs) + (j + 0.5) * dv
-            origin = tuple(a * u[k] + b * v[k] + w0 * d[k] for k in range(3))
-            intersector.Perform(gp_Lin(gp_Pnt(*origin), gp_Dir(*d)), 0.0, length)
-            if intersector.IsDone() and intersector.NbPnt() > 0:
-                hits += 1
-
-    area = hits * du * dv
-    return float(area), float(area)
-
-
 def undercut_fraction(points, intersector, d, max_len):
-    """
-    Frazione di superficie in sottosquadro per apertura lungo ±d.
-    points: lista di (punto, normale uscente), ognuno della stessa area.
-    """
-    if not points:
-        return 0.0
-
+    """Frazione di superficie in sottosquadro per apertura lungo ±d
+    (points: (punto, normale uscente), ognuno della stessa area)."""
     sin_neutral = math.sin(math.radians(PARTING_NEUTRAL_DEG))
     neg_d = (-d[0], -d[1], -d[2])
     blocked = 0
@@ -2012,15 +925,12 @@ def undercut_fraction(points, intersector, d, max_len):
         c = _dot(n, d)
         if abs(c) < sin_neutral:
             continue
-
-        pull = d if c > 0 else neg_d
         try:
             intersector.Perform(
-                gp_Lin(gp_Pnt(*p), gp_Dir(*pull)), THICKNESS_MIN_MM, max_len
+                gp_Lin(gp_Pnt(*p), gp_Dir(*(d if c > 0 else neg_d))), THICKNESS_MIN_MM, max_len
             )
         except Exception:
             continue
-
         if intersector.IsDone() and intersector.NbPnt() > 0:
             blocked += 1
 
@@ -2028,71 +938,42 @@ def undercut_fraction(points, intersector, d, max_len):
 
 
 def analyze_parting_and_projection(solids, shapes, cfg):
-    """
-    Sceglie la direzione di apertura e calcola l'area proiettata.
-
-    Ritorna un SimpleNamespace con: direction (nome), source (auto/CSV),
-    projected_area, contour_area, method, candidates (lista per direzione
-    con name, undercut_pct, projected_area, contour_area).
-    """
-    body_shapes = solids if solids else shapes
-    combined = combine_shapes(body_shapes)
-    combined_occ = wrap_occ(combined)
-
+    """Direzione di apertura scelta, area proiettata e dettaglio per
+    direzione candidata."""
+    body_shapes = solids or shapes
+    combined_occ = occ(combine_shapes(body_shapes))
     diag = bbox_diagonal(body_shapes)
     mesh_tol = min(max(diag * PROJECTION_MESH_TOL_REL, 0.005), 0.05)
 
-    intersector = IntCurvesFace_ShapeIntersector()
-    intersector.Load(combined_occ, 1e-6)
+    intersector = make_intersector(combined_occ)
 
-    use_polygons = Polygon is not None
-    if use_polygons:
-        method = "unione poligoni (shapely)"
-        triangles = []
-        for s in body_shapes:
-            triangles.extend(shape_triangles(s, mesh_tol, outward=bool(solids)))
-    else:
-        method = f"griglia raggi {PROJECTION_GRID_SIZE}x{PROJECTION_GRID_SIZE}"
-        logger.warning(
-            "shapely non installato: area proiettata con griglia di raggi "
-            "(più lenta e meno precisa). Installare con: pip install shapely"
-        )
-
-    def projection(d):
-        if use_polygons:
-            # Senza solidi l'orientamento non è affidabile: si proiettano
-            # tutti i triangoli (l'unione dà comunque la sagoma).
-            return silhouette_area_polygons(triangles, d, front_only=bool(solids))
-        return silhouette_area_grid(combined_occ, intersector, d)
+    # Senza solidi l'orientamento non è affidabile: si proiettano tutti i
+    # triangoli (l'unione dà comunque la sagoma).
+    triangles = [t for s in body_shapes for t in shape_triangles(s, mesh_tol, bool(solids))]
 
     # Punti per l'analisi sottosquadri, con normale uscente.
     points = []
     if solids:
-        areas = [max(safe_surface_area(s), 0.0) for s in solids]
+        areas = [surface_area(s) for s in solids]
         total = sum(areas) or 1.0
-        rng = random.Random(THICKNESS_RANDOM_SEED)
-
+        rng = random.Random(RANDOM_SEED)
         for s, area in zip(solids, areas):
-            w = wrap_occ(s)
-            try:
-                sign = -1.0 if signed_volume(w) < 0 else 1.0
-            except Exception:
-                continue
-
+            sign = -1.0 if signed_volume(occ(s)) < 0 else 1.0
             count = max(200, int(round(PARTING_RAY_COUNT * area / total)))
-            for p, n in sample_surface_points(w, count, rng, mesh_tol):
+            for p, n in sample_surface_points(occ(s), count, rng, mesh_tol):
                 points.append((p, (n[0] * sign, n[1] * sign, n[2] * sign)))
 
     forced = parse_parting_direction(cfg)
-    cands = (
-        [(forced, AXIS_DIRECTIONS[forced])] if forced
-        else candidate_directions(solids) if solids
-        else list(AXIS_DIRECTIONS.items())
-    )
+    if forced:
+        cands = [(forced, AXIS_DIRECTIONS[forced])]
+    elif solids:
+        cands = candidate_directions(solids)
+    else:
+        cands = list(AXIS_DIRECTIONS.items())
 
     results = []
     for name, d in cands:
-        proj, contour = projection(d)
+        proj, contour = silhouette_area(triangles, d, front_only=bool(solids))
         uc = undercut_fraction(points, intersector, d, 2.0 * diag + 1.0) if points else None
         results.append(SimpleNamespace(
             name=name,
@@ -2102,562 +983,381 @@ def analyze_parting_and_projection(solids, shapes, cfg):
         ))
 
     if forced:
-        best = results[0]
-        source = "da CSV"
+        best, source = results[0], "da CSV"
     elif points:
         best_uc = min(r.undercut_pct for r in results)
-        tie = [
-            r for r in results
-            if r.undercut_pct <= best_uc + 100.0 * PARTING_TIE_REL
-        ]
+        tie = [r for r in results if r.undercut_pct <= best_uc + 100.0 * PARTING_TIE_REL]
         best = max(tie, key=lambda r: r.projected_area)
-        source = "automatica (sottosquadri minimi)"
+        source = "automatica, sottosquadri minimi"
     else:
         best = max(results, key=lambda r: r.projected_area)
-        source = "automatica (nessun solido: area massima)"
+        source = "automatica, nessun solido: area massima"
 
     return SimpleNamespace(
         direction=best.name,
         source=source,
         projected_area=best.projected_area,
         contour_area=best.contour_area,
-        method=method,
         candidates=results,
     )
 
 
 # =========================================================================
-# EXPORT IMMAGINI
+# VISTA ISOMETRICA
 # =========================================================================
-def export_iso_image(shapes, safe_name, imported=None):
-    """
-    Genera immagine ISO in PNG.
-    Se imported viene fornito, prova prima con quello.
-    """
-    png_path = None
+def export_iso_image(shapes, safe_name):
+    """PNG isometrico in OUTPUT_DIR_VISTE, o None (serve cairosvg)."""
+    if cairosvg is None:
+        return None
 
+    svg_path = os.path.join(OUTPUT_DIR_VISTE, f"temp_{safe_name}.svg")
+    png_path = os.path.join(OUTPUT_DIR_VISTE, f"iso_{safe_name}.png")
     try:
-        os.makedirs(OUTPUT_DIR_VISTE, exist_ok=True)
-
-        temp_svg = os.path.join(OUTPUT_DIR_VISTE, f"temp_{safe_name}.svg")
-        png_candidate = os.path.join(OUTPUT_DIR_VISTE, f"iso_{safe_name}.png")
-
-        exported = False
-
-        if imported is not None:
-            try:
-                cq.exporters.export(
-                    imported,
-                    temp_svg,
-                    opt={"projectionDir": (1, -1, 0.75)}
-                )
-                exported = True
-            except Exception as e:
-                logger.warning(f"Export immagine con imported fallito: {e}")
-
-        if not exported:
-            combined = combine_shapes(shapes)
-            if combined is None:
-                return None
-
-            cq.exporters.export(
-                combined,
-                temp_svg,
-                opt={"projectionDir": (1, -1, 0.75)}
-            )
-
-        if os.path.exists(temp_svg):
-            if cairosvg is not None:
-                cairosvg.svg2png(url=temp_svg, write_to=png_candidate)
-
-                if os.path.exists(png_candidate):
-                    png_path = png_candidate
-
-            try:
-                os.remove(temp_svg)
-            except Exception:
-                pass
-
+        cq.exporters.export(combine_shapes(shapes), svg_path, opt=ISO_VIEW_OPTIONS)
+        cairosvg.svg2png(url=svg_path, write_to=png_path)
+        return png_path
     except Exception as e:
-        logger.warning(f"Impossibile generare immagine: {e}")
-        png_path = None
-
-    return png_path
+        logger.warning(f"Impossibile generare la vista ISO: {e}")
+        return None
+    finally:
+        if os.path.exists(svg_path):
+            os.remove(svg_path)
 
 
 # =========================================================================
-# ANALISI CORPI SEPARATI
+# ANALISI STEP
 # =========================================================================
 def extract_body_groups(top_shapes):
-    """
-    Se PROCESS_ASSEMBLY_BODIES_SEPARATELY è True, prova a separare
-    assembly o compound multi-solid in corpi distinti.
-    """
+    """Gruppi di shape da analizzare: uno per corpo se multibody."""
     if not PROCESS_ASSEMBLY_BODIES_SEPARATELY:
         return [top_shapes]
 
     groups = []
-
     for sh in top_shapes:
-        try:
-            solids = collect_solids([sh])
-        except Exception:
-            solids = []
+        solids = sh.Solids()
+        groups.extend([[s] for s in solids] if len(solids) > 1 else [[sh]])
 
-        if len(solids) > 1:
-            # Multi-solid dentro un singolo oggetto: separiamo i solidi.
-            groups.extend([[s] for s in solids])
-        else:
-            groups.append([sh])
-
-    groups = [g for g in groups if g]
-
-    if len(groups) <= 1:
-        return [top_shapes]
-
-    return groups
+    return groups if len(groups) > 1 else [top_shapes]
 
 
-# =========================================================================
-# ANALISI COMPLETA DI UN GRUPPO / CORPO
-# =========================================================================
-def analyze_shape_group(
-    step_path,
-    shapes,
-    cfg,
-    body_index,
-    body_count,
-    imported_for_image=None,
-):
-    """
-    Analisi geometrica di un singolo corpo/gruppo.
-    """
-    step_path = str(step_path)
-    filename = os.path.basename(step_path)
-    clean_name = os.path.splitext(filename)[0]
-    safe_name = sanitize_filename(clean_name) or "part"
-
+def analyze_body(filename, shapes, cfg, body_index, body_count):
+    """Analisi geometrica di un corpo: dati per la riga Excel."""
+    safe_name = re.sub(r"[^\w\-]+", "_", os.path.splitext(filename)[0]).strip("_") or "part"
     if body_count > 1:
-        safe_name = f"{safe_name}_body_{body_index}"
+        safe_name += f"_body_{body_index}"
 
-    # Solidi originali
-    original_solids = collect_solids(shapes)
+    # Solidi: originali, oppure riparati se lo STEP ha solo superfici/shell.
+    solids = collect_solids(shapes)
+    vol = sum(volume(s) for s in solids)
 
-    original_volume = sum(safe_volume(s) for s in original_solids)
-
-    # Repair multi-tolleranza, solo se i solidi originali non bastano
-    if original_volume > 0.0:
-        repaired_solids, repair_logs = [], ["repair non necessario"]
+    if vol > 0.0:
+        repair_note, repair_logs = "solidi originali", []
     else:
-        repaired_solids, repair_logs = try_repair_to_solids_multi(shapes)
-
-    repaired_volume = sum(safe_volume(s) for s in repaired_solids)
-
-    # Sceglie il set migliore di solidi
-    if repaired_volume > original_volume:
-        solids = repaired_solids
-        repair_note = (
-            f"Usati solidi riparati "
-            f"(volume riparato {repaired_volume:.6f} > "
-            f"originale {original_volume:.6f})."
-        )
-    else:
-        solids = original_solids
-        if original_solids:
-            repair_note = "Usati solidi originali."
+        repaired, repair_logs = repair_to_solids(shapes)
+        if repaired:
+            solids, vol = repaired, sum(volume(s) for s in repaired)
+            repair_note = "solidi riparati"
         else:
-            repair_note = "Nessun solido originale valido."
+            solids = []
+            repair_note = "nessun solido valido (volume non calcolabile)"
 
-    # Facce
-    face_source = solids if solids else shapes
-    faces = collect_faces(face_source)
+    surf = sum(surface_area(s) for s in (solids or shapes))
 
-    if not faces:
-        faces = collect_faces(shapes)
+    body_shapes = solids or shapes
+    bb = bounding_box(body_shapes)
+    bbox_str = f"{bb.xlen:.2f} x {bb.ylen:.2f} x {bb.zlen:.2f}" if bb else "0.00 x 0.00 x 0.00"
 
-    # Volume
-    if solids:
-        vol = sum(safe_volume(s) for s in solids)
-    else:
-        vol = sum(safe_volume(s) for s in shapes)
-
-    # Area superficiale
-    if solids:
-        surf = sum(safe_surface_area(s) for s in solids)
-    else:
-        surf = sum(safe_surface_area(s) for s in shapes)
-
-    # Fallback area: somma aree facce
-    if surf <= 0:
-        surf = sum(safe_face_area(f) for f in faces)
-
-    # Bounding box
-    bbox_shapes = solids if solids else shapes
-    bb = safe_bounding_box(bbox_shapes)
-
-    if bb is None:
-        bbox_str = "0.00 x 0.00 x 0.00"
-    else:
-        bbox_str = f"{bb.xlen:.2f} x {bb.ylen:.2f} x {bb.zlen:.2f}"
-
-    bbox_diag_value = bbox_diagonal(bbox_shapes)
-
-    # Soglia massima spessore da CSV
     cfg_max_thickness = get_max_thickness_from_cfg(cfg)
+    max_thickness = min(cfg_max_thickness, max(1.0, bbox_diagonal(body_shapes)))
 
-    if cfg_max_thickness > 0:
-        effective_max_thickness = min(
-            cfg_max_thickness,
-            max(1.0, bbox_diag_value)
-        )
-    else:
-        effective_max_thickness = max(50.0, bbox_diag_value)
-
-    # Spessore pareti (ray-casting)
-    thickness = compute_wall_thickness(
-        solids,
-        vol,
-        surf,
-        effective_max_thickness,
-    )
-
-    # Asse di sformo e area proiettata
+    thickness = compute_wall_thickness(solids, vol, surf, max_thickness)
     parting = analyze_parting_and_projection(solids, shapes, cfg)
 
-    # Valore cella B
-    part_name = str(cfg_get(cfg, "part_name", "")).strip()
+    part_name = str(cfg_get(cfg, "part_name")).strip()
     body_suffix = f" [Body {body_index}/{body_count}]" if body_count > 1 else ""
-    b_value = f"{part_name} CAD data: {filename}{body_suffix}".strip()
 
-    # Dati slider/lifter da CSV
-    sliders_lifters_info = str(cfg_get(cfg, "slider+lifter_Type/Qty", "")).strip()
-
-    # Immagine ISO
-    png_path = export_iso_image(
-        shapes=shapes,
-        safe_name=safe_name,
-        imported=imported_for_image,
-    )
-
-    # Report/log
-    log_geometry_report(
-        step_path=step_path,
-        body_index=body_index,
-        body_count=body_count,
-        shapes=shapes,
-        original_solids=original_solids,
-        repaired_solids=repaired_solids,
-        used_solids=solids,
-        faces=faces,
-        used_volume=vol,
-        used_surface=surf,
-        thickness=thickness,
-        parting=parting,
-        cfg_max_thickness=cfg_max_thickness,
-        effective_max_thickness=effective_max_thickness,
-        repair_note=repair_note,
-        repair_logs=repair_logs,
-    )
+    # Report nel log
+    t = thickness
+    lines = [
+        "=" * 80,
+        f"REPORT GEOMETRIA | {filename} | Body {body_index}/{body_count}",
+        "=" * 80,
+        f"Shape importate: {[sh.ShapeType() for sh in shapes]}",
+        f"Solidi usati: {len(solids)} ({repair_note})",
+        *[f"  repair {entry}" for entry in repair_logs],
+        f"Volume: {vol:.3f} mm3",
+        f"Superficie: {surf:.3f} mm2",
+        f"Ingombro: {bbox_str} mm",
+        f"Metodo spessore: {t.method} | raggi validi {t.samples}/{t.rays}",
+        f"Spessore nominale (mediana): {t.nominal:.3f} mm",
+        f"Spessore medio: {t.mean:.3f} mm",
+        f"Spessore P2 / P10 / P90 / P98 / max: {t.p2:.3f} / {t.p10:.3f} / "
+        f"{t.p90:.3f} / {t.p98:.3f} / {t.max:.3f} mm",
+        *[f"  {label:>16} mm: {pct:5.1f}%" for label, pct in t.histogram],
+        f"Spessore massimo misurabile: {max_thickness:.1f} mm (CSV/default {cfg_max_thickness:g})",
+        f"Direzione apertura stampo: {parting.direction} ({parting.source})",
+        f"Area proiettata: {parting.projected_area:.2f} mm2 "
+        f"(contorno esterno, fori inclusi: {parting.contour_area:.2f} mm2)",
+    ]
+    for c in parting.candidates:
+        uc = "n.d." if c.undercut_pct is None else f"{c.undercut_pct:5.1f}%"
+        lines.append(
+            f"  {c.name:<40} area proiettata {c.projected_area:12.2f} mm2 "
+            f"| sottosquadri {uc} superficie"
+        )
+    if vol <= 0.0:
+        lines.append(
+            "WARNING: volume = 0: lo STEP contiene superfici non chiudibili "
+            "in un solido (shell aperta, geometria non cucita o corrotta)"
+        )
+    logger.info("\n".join(lines))
 
     return {
-        "B": b_value,
-        "C": png_path,
+        "B": f"{part_name} CAD data: {filename}{body_suffix}".strip(),
+        "C": export_iso_image(shapes, safe_name),
         "I": float(vol),
         "N": round(thickness.nominal, 2),
         "N_max": round(thickness.p98, 2),
         "O": bbox_str,
         "P": round(parting.projected_area, 2),
-        "V": sliders_lifters_info,
     }
 
 
-# =========================================================================
-# ANALISI STEP -> RIGHE EXCEL
-# =========================================================================
-def analyze_step_for_excel(step_path, cfg):
-    """
-    Analizza uno STEP e ritorna una lista di righe.
-    Se lo STEP è assembly/multibody, può ritornare più righe.
-    """
-    step_path = str(step_path)
-
+def analyze_step(step_path, cfg):
+    """Righe Excel per uno STEP (più righe se multibody)."""
+    filename = os.path.basename(step_path)
     imported = cq.importers.importStep(step_path)
-    top_shapes = get_top_shapes(imported)
+    top_shapes = [v for v in imported.vals() if isinstance(v, cq.Shape) and not v.wrapped.IsNull()]
 
     if not top_shapes:
         raise ValueError("Nessuna geometria valida importata dallo STEP.")
 
-    body_groups = extract_body_groups(top_shapes)
+    groups = extract_body_groups(top_shapes)
+    return [
+        analyze_body(filename, group, cfg, idx, len(groups))
+        for idx, group in enumerate(groups, start=1)
+    ]
 
-    rows = []
 
-    for idx, group in enumerate(body_groups, start=1):
-        data = analyze_shape_group(
-            step_path=step_path,
-            shapes=group,
-            cfg=cfg,
-            body_index=idx,
-            body_count=len(body_groups),
-            imported_for_image=imported if len(body_groups) == 1 else None,
-        )
-        rows.append(data)
+# =========================================================================
+# EXCEL
+# =========================================================================
+def snapshot_row(ws, row):
+    """Valori e stili di una riga del template."""
+    return [
+        (col, ws.cell(row=row, column=col).value, copy.copy(ws.cell(row=row, column=col)._style))
+        for col in range(1, ws.max_column + 1)
+    ]
 
-    return rows
+
+def fill_row_from_template(ws, snapshot, src_row, dst_row):
+    """
+    Riproduce la riga dati del template su dst_row: stili, segnaposto e
+    formule riferite alla nuova riga (=SUM(I3:J3)/1000*K3 -> ...I5:J5...K5).
+    """
+    for col, value, style in snapshot:
+        cell = ws.cell(row=dst_row, column=col)
+        cell._style = copy.copy(style)
+        if isinstance(value, str) and value.startswith("="):
+            letter = get_column_letter(col)
+            value = Translator(value, origin=f"{letter}{src_row}").translate_formula(f"{letter}{dst_row}")
+        cell.value = value
+
+
+def extend_total_formulas(ws, first_row, last_row):
+    """Formule sotto la tabella riferite alla sola riga dati del template:
+    SUM(AQ3:AQ3) -> SUM(AQ3:AQ7)."""
+    pattern = re.compile(
+        r"(?<![A-Za-z$])(\$?[A-Z]{1,3}\$?)%d:(\$?[A-Z]{1,3}\$?)%d(?!\d)" % (first_row, first_row)
+    )
+    for row in ws.iter_rows(min_row=last_row + 1):
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.value = pattern.sub(
+                    lambda m: f"{m.group(1)}{first_row}:{m.group(2)}{last_row}", cell.value
+                )
+
+
+def insert_rows_keep_layout(ws, row_idx, amount):
+    """
+    ws.insert_rows() che sposta anche celle unite, altezze righe e immagini
+    sottostanti (openpyxl non lo fa e il layout del template si romperebbe).
+    """
+    merged_below = [str(rng) for rng in ws.merged_cells.ranges if rng.min_row >= row_idx]
+    for ref in merged_below:
+        ws.unmerge_cells(ref)
+
+    heights = {
+        r: dim.height for r, dim in ws.row_dimensions.items()
+        if r >= row_idx and dim.height is not None
+    }
+
+    ws.insert_rows(row_idx, amount)
+
+    for ref in merged_below:
+        rng = CellRange(ref)
+        rng.shift(row_shift=amount)
+        ws.merge_cells(rng.coord)
+
+    for r in heights:
+        ws.row_dimensions[r].height = None
+    for r, h in heights.items():
+        ws.row_dimensions[r + amount].height = h
+    for r in range(row_idx, row_idx + amount):
+        ws.row_dimensions[r].height = ws.row_dimensions[row_idx - 1].height
+
+    for img in ws._images:
+        for marker in (getattr(img.anchor, "_from", None), getattr(img.anchor, "to", None)):
+            if marker is not None and marker.row >= row_idx - 1:
+                marker.row += amount
+
+
+def prepare_data_rows(ws, count):
+    """
+    Prepara il form per 'count' pezzi in un'unica operazione: inserisce
+    count-1 righe sotto la riga dati del template, le riempie come la
+    riga del template e corregge i totali sotto la tabella.
+    """
+    if count <= 1:
+        return
+
+    first, last = DATA_START_ROW, DATA_START_ROW + count - 1
+    template_row = snapshot_row(ws, first)
+    insert_rows_keep_layout(ws, first + 1, count - 1)
+    for row in range(first + 1, last + 1):
+        fill_row_from_template(ws, template_row, first, row)
+    extend_total_formulas(ws, first, last)
+    extend_print_area(ws, first, count - 1)
+
+
+def extend_print_area(ws, data_row, amount):
+    """Area di stampa (nel template A1:AI3) estesa alle righe inserite."""
+    if not ws.print_area:
+        return
+
+    ranges = []
+    for ref in ws.print_area.split(","):
+        rng = CellRange(ref.split("!")[-1].replace("$", ""))
+        if rng.min_row > data_row:
+            rng.shift(row_shift=amount)
+        elif rng.max_row >= data_row:
+            rng.expand(down=amount)
+        ranges.append(rng.coord)
+    ws.print_area = ranges
+
+
+def fit_image_in_cell(img, ws, col_letter, row):
+    """Ridimensiona l'immagine nella cella mantenendo le proporzioni."""
+    box_w = (ws.column_dimensions[col_letter].width or 8.43) * 7.0 - 1.0
+    box_h = (ws.row_dimensions[row].height or 15.0) * 96.0 / 72.0 - 6.0
+    scale = min(box_w / img.width, box_h / img.height)
+    img.width = max(1, int(img.width * scale))
+    img.height = max(1, int(img.height * scale))
+
+
+def write_row(ws, row, index, cfg, data):
+    ws[f"{ITEM_NO_COLUMN}{row}"] = index
+
+    # Dati CSV; se vuoti resta il segnaposto del template.
+    for key, col in SETTINGS_COLUMN_MAP.items():
+        val = cfg_get(cfg, key)
+        if str(val).strip():
+            ws[f"{col}{row}"] = excel_value(key, val)
+
+    # Estrazione: idraulica oltre 550 t.
+    tons = [int(n) for n in re.findall(r"\d+", str(cfg_get(cfg, "press")))]
+    ws[f"Z{row}"] = "hydraulic" if tons and max(tons) > 550 else "mechanic"
+
+    # Dati geometrici
+    for col in ("B", "I", "N", "O", "P"):
+        ws[f"{col}{row}"] = data[col]
+    if THICKNESS_MAX_COLUMN:
+        ws[f"{THICKNESS_MAX_COLUMN}{row}"] = data["N_max"]
+
+    if data["C"]:
+        img = XLImage(data["C"])
+        fit_image_in_cell(img, ws, "C", row)
+        ws.add_image(img, f"C{row}")
 
 
 # =========================================================================
 # MAIN
 # =========================================================================
 def main():
-    # Mapping colonne CSV -> Excel
-    SETTINGS_COLUMN_MAP = {
-        "demand_average_yearly_volume": "D",
-        "raw_material": "E",
-        "color": "F",
-        "surface_finishing": "G",
-        "cavities": "H",
-        "density": "K",
-        "inserts_steel": "Q",
-        "sliders_steel": "R",
-        "gate_type": "W",
-        "drop_number": "Y",
-        "mold_lifetime": "AA",
-        "cycle_time": "AM",
-        "press": "AN",
-    }
-
-    # ---------------------------------------------------------------------
-    # Caricamento settings.csv
-    # ---------------------------------------------------------------------
-    cfg_list = []
-
-    if os.path.exists(PATH_SETTINGS):
-        with open(PATH_SETTINGS, "r", encoding="utf-8-sig", newline="") as f:
-            # Excel in italiano salva i CSV con ';' (la virgola è il
-            # separatore decimale): si riconosce il delimitatore.
-            sample = f.read(4096)
-            f.seek(0)
-            try:
-                delimiter = csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
-            except csv.Error:
-                delimiter = ";" if sample.count(";") > sample.count(",") else ","
-
-            reader = csv.DictReader(f, delimiter=delimiter)
-
-            for row in reader:
-                # Salta righe completamente vuote
-                if all(v is None or str(v).strip() == "" for v in row.values()):
-                    continue
-
-                # Pulizia sicura: gestisce None sia in chiavi che in valori
-                cleaned_row = {}
-
-                for k, v in row.items():
-                    clean_key = k.strip() if isinstance(k, str) else ""
-
-                    if not clean_key:
-                        continue
-
-                    if isinstance(v, str):
-                        clean_val = v.strip()
-                    elif v is None:
-                        clean_val = ""
-                    else:
-                        clean_val = v
-
-                    cleaned_row[clean_key] = clean_val
-
-                if cleaned_row:
-                    cfg_list.append(cleaned_row)
-
-        logger.info(
-            f"Caricati {len(cfg_list)} record da settings.csv "
-            f"(delimitatore '{delimiter}')"
-        )
-    else:
-        logger.warning("Attenzione: settings.csv non trovato.")
-        cfg_list = []
-
-    project = cfg_get(cfg_list[0], "project", "Default_Project") if cfg_list else "Default_Project"
-    project_safe = sanitize_filename(project)
-
-    # ---------------------------------------------------------------------
-    # Template Excel
-    # ---------------------------------------------------------------------
-    # Il form viene SEMPRE generato dal template: se manca ci si ferma,
-    # invece di produrre un foglio bianco con i dati incollati.
-    template_path = find_template_path()
-    if template_path is None:
-        fatal(
-            f"Template non trovato in {BASE_DIR}. "
-            f"Atteso uno di: {', '.join(TEMPLATE_CANDIDATES)}"
-        )
-        return
-
-    try:
-        wb, out_ext = open_template(template_path)
-    except Exception as e:
-        logger.exception("Dettaglio errore apertura template")
-        fatal(f"Errore apertura template {template_path}: {e}")
-        return
-
-    target_excel_path = os.path.join(BASE_DIR, f"{project_safe}{out_ext}")
-    if os.path.abspath(target_excel_path) == os.path.abspath(template_path):
-        target_excel_path = os.path.join(BASE_DIR, f"{project_safe}_RFQ{out_ext}")
-
-    if TEMPLATE_SHEET_NAME:
-        if TEMPLATE_SHEET_NAME not in wb.sheetnames:
-            fatal(
-                f"Foglio '{TEMPLATE_SHEET_NAME}' non presente nel template. "
-                f"Fogli disponibili: {wb.sheetnames}"
-            )
-            return
-        ws = wb[TEMPLATE_SHEET_NAME]
-    else:
-        ws = wb.active
-
-    logger.info(f"Template: {template_path} | foglio: '{ws.title}'")
-
+    start = time.time()
     os.makedirs(OUTPUT_DIR_VISTE, exist_ok=True)
 
-    # Data odierna
-    ws[DATE_CELL] = datetime.now().strftime("%Y-%m-%d")
+    if not os.path.exists(PATH_TEMPLATE):
+        fatal(f"Template non trovato: {PATH_TEMPLATE}")
+        return
 
-    # ---------------------------------------------------------------------
-    # Ricerca file STEP
-    # ---------------------------------------------------------------------
-    if os.path.exists(PATH_INPUT):
-        step_files = sorted([
-            os.path.join(PATH_INPUT, f)
-            for f in os.listdir(PATH_INPUT)
-            if f.lower().endswith((".step", ".stp"))
-        ])
-    else:
-        os.makedirs(PATH_INPUT, exist_ok=True)
-        step_files = []
+    cfg_list = load_settings()
+    step_files = sorted(
+        f for f in os.listdir(PATH_INPUT) if f.lower().endswith((".step", ".stp"))
+    ) if os.path.isdir(PATH_INPUT) else []
 
-    logger.info(f"Avvio elaborazione: {len(step_files)} file STEP.")
+    if not step_files:
+        fatal(f"Nessun file STEP in {PATH_INPUT}")
+        return
 
-    # ---------------------------------------------------------------------
-    # 1) Analisi di tutti gli STEP: si conosce subito il numero di righe
-    #    (un file multibody può generarne più di una)
-    # ---------------------------------------------------------------------
+    console(f"Compilazione RFQ: {len(step_files)} file STEP, {len(cfg_list)} righe in settings.csv")
+    if cairosvg is None:
+        logger.warning("cairosvg non installato: viste ISO non generate")
+
+    # 1) Analisi di tutti gli STEP (un multibody può dare più righe)
     results = []
     errors = 0
+    for i, name in enumerate(step_files, start=1):
+        label = f"[{i}/{len(step_files)}] {name}"
+        cfg = find_cfg_for_step(name, cfg_list)
+        if cfg is None:
+            console(f"{label}: saltato, nessuna riga in settings.csv")
+            continue
 
-    for step_file in step_files:
-        name = os.path.basename(step_file)
+        print(f"{label} ...", end="", flush=True)
+        t0 = time.time()
         try:
-            cfg = find_cfg_for_step(step_file, cfg_list)
-
-            # Salta se non c'è configurazione valida
-            if not cfg:
-                logger.info(f"SKIP '{name}'")
-                continue
-
             with capture_native_output():
-                rows = analyze_step_for_excel(step_file, cfg)
-
-            if not rows:
-                logger.warning(f"Nessuna riga generata per '{name}'")
-                continue
-
-            results.extend((cfg, data) for data in rows)
-
+                rows = analyze_step(os.path.join(PATH_INPUT, name), cfg)
         except Exception as e:
             errors += 1
             logger.exception(f"Errore su {name}: {e}")
+            status = "ERRORE (vedi log)"
+        else:
+            results.extend((cfg, data) for data in rows)
+            bodies = f", {len(rows)} corpi" if len(rows) > 1 else ""
+            status = f"ok{bodies} ({time.time() - t0:.1f} s)"
 
-    # ---------------------------------------------------------------------
-    # 2) Righe del form inserite in un colpo solo, formule già corrette
-    # ---------------------------------------------------------------------
+        print(f" {status}", flush=True)
+        logger.info(f"{label}: {status}")
+
+    # 2) Righe del form inserite in un colpo solo, poi scrittura dati
+    console("Scrittura Excel ...")
+    wb = openpyxl.load_workbook(PATH_TEMPLATE)
+    ws = wb.active
+    ws[DATE_CELL] = datetime.now().strftime("%Y-%m-%d")
+
     prepare_data_rows(ws, len(results))
-
-    # ---------------------------------------------------------------------
-    # 3) Scrittura dati
-    # ---------------------------------------------------------------------
     for index, (cfg, data) in enumerate(results):
-        excel_row = DATA_START_ROW + index
+        write_row(ws, DATA_START_ROW + index, index + 1, cfg, data)
+        logger.info(f"Riga {DATA_START_ROW + index}: {data['B']}")
 
-        if ITEM_NO_COLUMN:
-            ws[f"{ITEM_NO_COLUMN}{excel_row}"] = index + 1
-
-        # Dati CSV (se vuoti resta il segnaposto del template)
-        for key, col in SETTINGS_COLUMN_MAP.items():
-            val = cfg_get(cfg, key, "")
-            if str(val).strip():
-                ws[f"{col}{excel_row}"] = excel_value(key, val)
-
-        # Logica Cell Z: Valutazione pressa (tonnellaggio)
-        press_text = str(cfg_get(cfg, "press", ""))
-        tons_list = [int(n) for n in re.findall(r"\d+", press_text)]
-        max_tons = max(tons_list) if tons_list else 0
-
-        ws[f"Z{excel_row}"] = "hydraulic" if max_tons > 550 else "mechanic"
-
-        # Dati analisi geometrica
-        mapping = {
-            "B": "B",
-            "I": "I",
-            "N": "N",
-            "O": "O",
-            "P": "P",
-            "V": "V",
-        }
-
-        if THICKNESS_MAX_COLUMN:
-            mapping["N_max"] = THICKNESS_MAX_COLUMN
-
-        for key, col in mapping.items():
-            val = data.get(key, "")
-            if val is not None and str(val).strip():
-                ws[f"{col}{excel_row}"] = val
-
-        # Immagine in colonna C
-        img_path = data.get("C")
-
-        if img_path and os.path.exists(img_path):
-            try:
-                img = XLImage(img_path)
-                fit_image_in_cell(img, ws, "C", excel_row)
-                ws.add_image(img, f"C{excel_row}")
-            except Exception as img_exc:
-                logger.warning(f"Errore inserimento immagine: {img_exc}")
-
-        logger.info(
-            f"Riga {excel_row}: {data['B']} | "
-            f"Press: {max_tons}t -> {ws[f'Z{excel_row}'].value} | "
-            f"Sliders: {data['V']}"
-        )
-
-    # ---------------------------------------------------------------------
-    # Pulizia SVG residui
-    # ---------------------------------------------------------------------
-    for f in os.listdir(OUTPUT_DIR_VISTE):
-        if f.lower().endswith(".svg"):
-            try:
-                os.remove(os.path.join(OUTPUT_DIR_VISTE, f))
-            except Exception:
-                pass
-
-    # ---------------------------------------------------------------------
-    # Salvataggio Excel
-    # ---------------------------------------------------------------------
+    project = cfg_get(cfg_list[0], "project", "") if cfg_list else ""
+    project = re.sub(r"[^\w\-]+", "_", project).strip("_") or "Default_Project"
+    target = os.path.join(OUTPUT_DIR, f"{project}.xlsx")
     try:
-        wb.save(target_excel_path)
+        wb.save(target)
     except Exception as e:
         logger.exception("Dettaglio errore salvataggio")
-        fatal(f"Errore salvataggio {target_excel_path}: {e}")
+        fatal(f"Impossibile salvare {target}: {e} (file aperto in Excel?)")
         return
 
-    summary = f"Completato: {len(results)} righe generate"
+    summary = f"Completato in {time.time() - start:.0f} s: {len(results)} righe"
     if errors:
-        summary += f", {errors} file STEP con errori"
-    logger.info(f"{summary}. Salvato in: {target_excel_path}")
-
-    print(f"{summary}.")
-    print(f"Excel: {target_excel_path}")
-    print(f"Log:   {LOG_FILE}")
+        summary += f", {errors} file con errori"
+    console(summary)
+    console(f"Excel: {target}")
+    console(f"Log:   {LOG_FILE}")
 
 
 if __name__ == "__main__":
@@ -2666,6 +1366,6 @@ if __name__ == "__main__":
     logger.info(f"Avvio {datetime.now():%Y-%m-%d %H:%M:%S}")
     try:
         main()
-    except Exception:
+    except Exception as e:
         logger.exception("Errore non gestito")
-        print(f"Errore. Dettagli nel log: {LOG_FILE}")
+        fatal(str(e))
