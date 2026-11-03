@@ -38,6 +38,18 @@ USO
     python sigit_cli.py login --show-browser         # test di solo login
     python sigit_cli.py download -o ./documenti      # scarica tutto
     python sigit_cli.py download -o ./documenti --dry-run   # elenca soltanto
+
+    # Cartellino: per OGNI giorno dell'intervallo scarica le ore di TUTTE le
+    # causali presenti (anche non elencate in CAUSALI, anche a 00:00, e ogni
+    # occorrenza se una causale compare più volte nello stesso giorno)
+    python sigit_cli.py cartellino --start 2026-01-01 --end 2026-10-31 --db cartellino.db
+    python sigit_cli.py cartellino --solo-causali-note   # solo le causali di CAUSALI
+    python sigit_cli.py cartellino --escludi-zero        # non salvare le causali a 00:00
+
+    Tabelle/viste nel DB SQLite:
+      cartellino              una riga per occorrenza (anno, mese, giorno, causale, progressivo, ore)
+      cartellino_giornaliero  vista: ore sommate per giorno e causale
+      giorni_letti            giorni effettivamente letti (anche quelli senza causali)
 """
 
 from __future__ import annotations
@@ -125,9 +137,16 @@ SELECTORS = {
 NAV_TIMEOUT_MS = 30_000
 DOWNLOAD_TIMEOUT_MS = 60_000
 
-# Causali da estrarre dal cartellino: il testo dopo l'etichetta, fino al
-# valore HH:MM, viene catturato con una regex (confermato: label e valore
-# sono nello stesso nodo di testo, es. "ORE ORDINARIE 03: 08:00").
+# Causali NOTE del cartellino. Per default lo script NON si limita più a
+# queste: estrae QUALSIASI etichetta in maiuscolo seguita da una durata
+# HH:MM (vedi CAUSALE_GENERIC_RE), così vengono scaricate tutte le causali
+# effettivamente presenti in ogni giorno, anche quelle non elencate qui.
+# Questa lista serve a:
+#   - normalizzare l'etichetta quando la regex generica cattura anche testo
+#     in maiuscolo che precede la causale (es. "GIORNO ORE ORDINARIE" ->
+#     "ORE ORDINARIE");
+#   - segnalare a fine esecuzione le causali NUOVE (non in elenco);
+#   - limitare l'estrazione solo a queste con --solo-causali-note.
 CAUSALI = [
     "ORE ORDINARIE",
     "STRAORD. FORFAIT",
@@ -139,6 +158,16 @@ CAUSALI = [
     "MALA. LUNGA >30GG",
     "RIPOSO DOMENICA",
 ]
+
+# Parole che, se presenti nell'etichetta, indicano che la coppia
+# 'ETICHETTA HH:MM' NON è una causale del giorno ma un totale o un orario di
+# timbratura (che cambierebbero ad ogni click e verrebbero scambiati per
+# causali nuove). Aggiungine altre se a fine esecuzione, nel riepilogo delle
+# causali trovate, compaiono etichette che non sono causali.
+CAUSALI_PAROLE_ESCLUSE = {
+    "TOTALE", "TOTALI", "TOT", "TOT.",
+    "ENTRATA", "USCITA", "TIMBRATURA", "TIMBRATURE",
+}
 
 ITALIAN_MONTHS = {
     "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4,
@@ -225,14 +254,60 @@ CAUSALE_VALUE_RE = re.compile(
 )
 
 
-def find_causale_matches(text: str) -> list[tuple[str, float]]:
+# Regex GENERICA: qualsiasi etichetta in maiuscolo (una o più "parole"
+# separate da singoli spazi, che possono contenere cifre e . , / ' ( ) < > %
+# + & -, ma la prima deve iniziare con una lettera) seguita da spazi/tab e da
+# una durata HH:MM. Tollera anche un eventuale codice 'NN:' tra etichetta e
+# durata (es. "ORE ORDINARIE 03: 08:00"). Il lookbehind evita di partire a
+# metà parola (es. 'FERIE' dentro 'PERMESSO/FERIE').
+_UP = "A-ZÀ-ÖØ-Þ"
+_TOK_CHARS = rf"{_UP}0-9.,/'()<>%+&\-"
+CAUSALE_GENERIC_RE = re.compile(
+    rf"(?<![\w./'\-])"
+    rf"([{_UP}][{_TOK_CHARS}]*(?: [{_TOK_CHARS}]+)*)"
+    rf"[ \t]+(?:\d{{1,2}}:[ \t]+)?"
+    rf"(\d{{1,3}}:\d{{2}})(?!\d)"
+)
+
+_CAUSALI_BY_LEN = sorted(CAUSALI, key=len, reverse=True)
+
+
+def normalize_causale_label(label: str) -> str | None:
+    """Ripulisce un'etichetta catturata dalla regex generica. Ritorna None se
+    non è una causale (totali, timbrature, etichette senza lettere)."""
+    label = re.sub(r"\s+", " ", label).strip()
+    # toglie eventuali numeri isolati in coda (es. un giorno 'ORE ORDINARIE 03')
+    label = re.sub(r"(?: \d+)+$", "", label)
+    if len(re.findall(rf"[{_UP}]", label)) < 2:
+        return None
+    if any(word in CAUSALI_PAROLE_ESCLUSE for word in label.split(" ")):
+        return None
+    # se l'etichetta finisce con una causale nota, usa quella (scarta il
+    # testo in maiuscolo che eventualmente la precede)
+    for known in _CAUSALI_BY_LEN:
+        if label == known or label.endswith(" " + known):
+            return known
+    return label
+
+
+def find_causale_matches(text: str, solo_note: bool = False) -> list[tuple[str, float]]:
     """Trova TUTTE le occorrenze 'causale + ore' nel testo, nell'ordine in
     cui compaiono (non solo la prima per causale: serve per poter contare
-    quante volte compare ciascuna, vedi harvest_month). Tutte le causali,
-    SMART WORKING inclusa, seguono lo stesso formato 'ETICHETTA HH:MM'
-    (confermato)."""
+    quante volte compare ciascuna, vedi harvest_month).
+
+    Per default usa la regex generica, quindi cattura tutte le causali
+    presenti, anche quelle non elencate in CAUSALI. Con solo_note=True si
+    limita alle causali di CAUSALI (comportamento precedente)."""
     result: list[tuple[str, float]] = []
-    for label, value in CAUSALE_VALUE_RE.findall(text):
+    if solo_note:
+        for label, value in CAUSALE_VALUE_RE.findall(text):
+            result.append((label, hhmm_to_hours(value)))
+        return result
+
+    for raw_label, value in CAUSALE_GENERIC_RE.findall(text):
+        label = normalize_causale_label(raw_label)
+        if label is None:
+            continue
         result.append((label, hhmm_to_hours(value)))
     return result
 
@@ -596,6 +671,15 @@ class CartellinoRow:
     giorno: int
     causale: str
     ore: float
+    progressivo: int = 1  # n-esima occorrenza della stessa causale nello stesso giorno
+
+
+@dataclass
+class MonthHarvest:
+    rows: list[CartellinoRow] = field(default_factory=list)
+    giorni_letti: list[int] = field(default_factory=list)      # giorni cliccati e letti
+    giorni_mancanti: list[int] = field(default_factory=list)   # giorni non trovati in griglia
+    panel_replaced: bool = False  # True se il pannello viene sostituito (non accumulato) ad ogni click
 
 
 async def click_day(page: Page, year: int, month: int, day_num: int) -> bool:
@@ -651,7 +735,28 @@ async def click_day(page: Page, year: int, month: int, day_num: int) -> bool:
     return True
 
 
-async def harvest_month(page: Page, year: int, month: int, start: date, end: date) -> list[CartellinoRow]:
+async def read_matches(page: Page, solo_note: bool) -> Counter:
+    text = await page.locator("body").inner_text()
+    return Counter(find_causale_matches(text, solo_note=solo_note))
+
+
+def format_day_summary(day_rows: list[CartellinoRow]) -> str:
+    if not day_rows:
+        return "nessuna causale"
+    return ", ".join(f"{r.causale} {r.ore:g}h" for r in day_rows)
+
+
+async def harvest_month(
+    page: Page,
+    year: int,
+    month: int,
+    start: date,
+    end: date,
+    solo_note: bool = False,
+    escludi_zero: bool = False,
+    panel_replaced: bool = False,
+    session_baseline: Counter | None = None,
+) -> MonthHarvest:
     """Per ogni giorno del mese nell'intervallo [start, end], clicca sul
     giorno nella griglia calendario. Il click aggiunge (non sostituisce) una
     riga 'CAUSALE HH:MM' al pannello 'Stampa cartellino mensile' a fianco
@@ -665,40 +770,44 @@ async def harvest_month(page: Page, year: int, month: int, start: date, end: dat
     di cliccare qualsiasi giorno, così eventuali righe residue di mesi
     precedenti (se il pannello non si svuota cambiando mese) non vengono
     attribuite per errore al primo giorno del mese nuovo.
+
+    Per OGNI giorno dell'intervallo vengono salvate TUTTE le causali che
+    compaiono (anche quelle non presenti nell'elenco CAUSALI e, salvo
+    --escludi-zero, anche quelle a 00:00), con TUTTE le occorrenze: se la
+    stessa causale compare più volte nello stesso giorno, ogni occorrenza
+    diventa una riga distinta (colonna 'progressivo').
+
+    Robustezza:
+    - se un giorno non si trova nella griglia (es. un click precedente ha
+      fatto cambiare mese al calendario), si torna al mese giusto, si
+      riprende la baseline e si ritenta una volta;
+    - se dopo un click alcune righe SPARISCONO dal pannello, vuol dire che
+      il pannello viene sostituito e non accumulato: in quel caso ogni
+      giorno va letto come differenza rispetto alla baseline del mese (e
+      non rispetto al click precedente), altrimenti due giorni consecutivi
+      identici darebbero il secondo vuoto. Appena lo si scopre, il mese
+      viene riletto da capo in questa modalità, che resta attiva anche per
+      i mesi successivi (panel_replaced viene restituito al chiamante).
+      session_baseline è la lettura della pagina del Cartellino appena
+      aperta, prima di cliccare qualsiasi giorno (serve in questa modalità
+      per riconoscere il testo statico della pagina).
     """
-    rows_out: list[CartellinoRow] = []
-    clicked_at_least_one_day = False
-    last_day = calendar.monthrange(year, month)[1]
-
-    baseline_text = await page.locator("body").inner_text()
-    previous_matches = Counter(find_causale_matches(baseline_text))
-
-    for day_num in range(1, last_day + 1):
-        try:
-            current_date = date(year, month, day_num)
-        except ValueError:
+    while True:
+        result = await _harvest_month_days(
+            page, year, month, start, end, solo_note, escludi_zero, panel_replaced,
+            session_baseline if session_baseline is not None else Counter(),
+        )
+        if result.panel_replaced and not panel_replaced:
+            print(
+                "  ℹ️  Il pannello delle causali viene sostituito (non accumulato) ad ogni click: "
+                f"rileggo {month:02d}/{year} da capo in questa modalità."
+            )
+            panel_replaced = True
+            await goto_month(page, year, month)
             continue
-        if current_date < start or current_date > end:
-            continue
+        break
 
-        found = await click_day(page, year, month, day_num)
-        if not found:
-            print(f"  ⚠️  Giorno {day_num:02d}/{month:02d}/{year} non trovato nella griglia, salto.")
-            continue
-        clicked_at_least_one_day = True
-
-        page_text = await page.locator("body").inner_text()
-        current_matches = Counter(find_causale_matches(page_text))
-
-        new_matches = current_matches - previous_matches  # solo ciò che è aumentato
-        for (causale, ore), count in new_matches.items():
-            if ore <= 0:
-                continue  # salta le causali a zero ore; rimuovi il filtro se le vuoi comunque
-            rows_out.extend(CartellinoRow(year, month, day_num, causale, ore) for _ in range(count))
-
-        previous_matches = current_matches
-
-    if clicked_at_least_one_day and not rows_out:
+    if result.giorni_letti and not result.rows:
         print(
             f"  ⚠️  Nessuna causale trovata in tutto {month:02d}/{year} pur avendo cliccato "
             "giorni validi: salvo screenshot e testo grezzo dell'ultimo giorno aperto per capire "
@@ -707,33 +816,169 @@ async def harvest_month(page: Page, year: int, month: int, start: date, end: dat
         )
         await dump_page_diagnostics(page, f"harvest_zero_{year}_{month:02d}")
 
-    return rows_out
+    return result
+
+
+async def _harvest_month_days(
+    page: Page,
+    year: int,
+    month: int,
+    start: date,
+    end: date,
+    solo_note: bool,
+    escludi_zero: bool,
+    panel_replaced: bool,
+    session_baseline: Counter,
+) -> MonthHarvest:
+    """Un passaggio sui giorni del mese (vedi harvest_month).
+
+    - Pannello che si accumula: il giorno è la differenza tra la lettura
+      dopo il click e quella dopo il click precedente.
+    - Pannello sostituito: il giorno è la lettura meno la parte 'statica'
+      della pagina, cioè ciò che compare sia nella pagina del Cartellino
+      appena aperta (session_baseline, prima di qualsiasi click) sia in
+      TUTTE le letture del mese. Per questo in tale modalità i giorni
+      vengono prima letti tutti e poi elaborati.
+
+    Se non si era in modalità 'pannello sostituito' e la si rileva, si
+    interrompe subito restituendo panel_replaced=True, così il chiamante
+    rilegge il mese da capo."""
+    result = MonthHarvest(panel_replaced=panel_replaced)
+    last_day = calendar.monthrange(year, month)[1]
+
+    previous_matches = await read_matches(page, solo_note)
+    readings: list[tuple[int, Counter]] = []
+
+    for day_num in range(1, last_day + 1):
+        current_date = date(year, month, day_num)
+        if current_date < start or current_date > end:
+            continue
+
+        found = await click_day(page, year, month, day_num)
+        if not found:
+            print(
+                f"  ⚠️  Giorno {day_num:02d}/{month:02d}/{year} non trovato nella griglia: "
+                "torno al mese e ritento..."
+            )
+            await goto_month(page, year, month)
+            previous_matches = await read_matches(page, solo_note)
+            found = await click_day(page, year, month, day_num)
+        if not found:
+            print(f"  ✘ Giorno {day_num:02d}/{month:02d}/{year} non trovato nemmeno al secondo tentativo, salto.")
+            result.giorni_mancanti.append(day_num)
+            continue
+
+        current_matches = await read_matches(page, solo_note)
+
+        if panel_replaced:
+            readings.append((day_num, current_matches))
+        else:
+            if previous_matches - current_matches:  # qualcosa è sparito: pannello sostituito
+                result.panel_replaced = True
+                return result
+            readings.append((day_num, current_matches - previous_matches))  # solo ciò che è aumentato
+        previous_matches = current_matches
+
+    if panel_replaced:
+        static = Counter(session_baseline)
+        for _, reading in readings:
+            static &= reading
+        readings = [(day_num, reading - static) for day_num, reading in readings]
+
+    for day_num, new_matches in readings:
+        day_rows: list[CartellinoRow] = []
+        progressivi: Counter = Counter()
+        for (causale, ore), count in new_matches.items():
+            if escludi_zero and ore <= 0:
+                continue
+            for _ in range(count):
+                progressivi[causale] += 1
+                day_rows.append(CartellinoRow(year, month, day_num, causale, ore, progressivi[causale]))
+        print(f"  {day_num:02d}/{month:02d}/{year}: {format_day_summary(day_rows)}")
+        result.rows.extend(day_rows)
+        result.giorni_letti.append(day_num)
+
+    return result
+
+
+CARTELLINO_DDL = """
+    CREATE TABLE IF NOT EXISTS cartellino (
+        anno INTEGER NOT NULL,
+        mese INTEGER NOT NULL,
+        giorno INTEGER NOT NULL,
+        causale TEXT NOT NULL,
+        progressivo INTEGER NOT NULL DEFAULT 1,
+        ore REAL,
+        PRIMARY KEY (anno, mese, giorno, causale, progressivo)
+    )
+"""
 
 
 def init_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
+
+    # Migrazione dal vecchio schema (PK senza 'progressivo', che teneva una
+    # sola riga per causale per giorno e sovrascriveva le altre occorrenze).
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(cartellino)")]
+    if cols and "progressivo" not in cols:
+        print("Aggiorno lo schema del database (aggiungo la colonna 'progressivo')...")
+        conn.execute("DROP VIEW IF EXISTS cartellino_giornaliero")
+        conn.execute("ALTER TABLE cartellino RENAME TO cartellino_old")
+        conn.execute(CARTELLINO_DDL)
+        conn.execute(
+            "INSERT INTO cartellino (anno, mese, giorno, causale, progressivo, ore) "
+            "SELECT anno, mese, giorno, causale, 1, ore FROM cartellino_old"
+        )
+        conn.execute("DROP TABLE cartellino_old")
+
+    conn.execute(CARTELLINO_DDL)
+    # Elenco dei giorni effettivamente letti: permette di distinguere un
+    # giorno senza causali (letto, 0 righe in 'cartellino') da uno mai letto.
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS cartellino (
+        CREATE TABLE IF NOT EXISTS giorni_letti (
             anno INTEGER NOT NULL,
             mese INTEGER NOT NULL,
             giorno INTEGER NOT NULL,
-            causale TEXT NOT NULL,
-            ore REAL,
-            PRIMARY KEY (anno, mese, giorno, causale)
+            letto_il TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            PRIMARY KEY (anno, mese, giorno)
         )
+        """
+    )
+    # Totale ore per giorno e causale (somma delle eventuali occorrenze multiple)
+    conn.execute(
+        """
+        CREATE VIEW IF NOT EXISTS cartellino_giornaliero AS
+        SELECT anno, mese, giorno, causale, SUM(ore) AS ore, COUNT(*) AS occorrenze
+        FROM cartellino
+        GROUP BY anno, mese, giorno, causale
         """
     )
     conn.commit()
     return conn
 
 
-def save_rows(conn: sqlite3.Connection, rows: list[CartellinoRow]) -> None:
-    conn.executemany(
-        "INSERT OR REPLACE INTO cartellino (anno, mese, giorno, causale, ore) VALUES (?, ?, ?, ?, ?)",
-        [(r.anno, r.mese, r.giorno, r.causale, r.ore) for r in rows],
-    )
-    conn.commit()
+def save_month(conn: sqlite3.Connection, year: int, month: int, harvest: MonthHarvest) -> None:
+    """Salva i dati del mese: per ogni giorno letto, CANCELLA le righe
+    precedenti di quel giorno e inserisce quelle appena lette, così
+    rilanciare lo script su un intervallo già scaricato aggiorna i dati
+    senza lasciare causali/occorrenze vecchie non più presenti."""
+    with conn:
+        for day in harvest.giorni_letti:
+            conn.execute(
+                "DELETE FROM cartellino WHERE anno = ? AND mese = ? AND giorno = ?",
+                (year, month, day),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO giorni_letti (anno, mese, giorno, letto_il) "
+                "VALUES (?, ?, ?, datetime('now', 'localtime'))",
+                (year, month, day),
+            )
+        conn.executemany(
+            "INSERT OR REPLACE INTO cartellino (anno, mese, giorno, causale, progressivo, ore) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(r.anno, r.mese, r.giorno, r.causale, r.progressivo, r.ore) for r in harvest.rows],
+        )
 
 
 def iter_months(start: date, end: date):
@@ -839,18 +1084,58 @@ async def cmd_cartellino(args: argparse.Namespace) -> None:
         try:
             await login(page, username, password)
             await goto_cartellino(page)
+            # lettura della pagina prima di qualsiasi click su un giorno
+            session_baseline = await read_matches(page, args.solo_causali_note)
 
             months = list(iter_months(start, end))
             total_rows = 0
+            total_days = 0
+            missing_days: list[date] = []
+            per_causale: Counter = Counter()
+            ore_per_causale: dict[str, float] = {}
+            panel_replaced = False
             for idx, (year, month) in enumerate(months, start=1):
                 print(f"\n--- Mese {idx}/{len(months)}: {month:02d}/{year} ---")
                 await goto_month(page, year, month)
-                rows = await harvest_month(page, year, month, start, end)
-                save_rows(conn, rows)
-                total_rows += len(rows)
-                print(f"  {len(rows)} righe causale/ore salvate (totale finora: {total_rows}).")
+                harvest = await harvest_month(
+                    page, year, month, start, end,
+                    solo_note=args.solo_causali_note,
+                    escludi_zero=args.escludi_zero,
+                    panel_replaced=panel_replaced,
+                    session_baseline=session_baseline,
+                )
+                panel_replaced = harvest.panel_replaced
+                save_month(conn, year, month, harvest)
+                total_rows += len(harvest.rows)
+                total_days += len(harvest.giorni_letti)
+                missing_days.extend(date(year, month, d) for d in harvest.giorni_mancanti)
+                for r in harvest.rows:
+                    per_causale[r.causale] += 1
+                    ore_per_causale[r.causale] = ore_per_causale.get(r.causale, 0.0) + r.ore
+                print(
+                    f"  {len(harvest.giorni_letti)} giorni letti, {len(harvest.rows)} righe causale/ore "
+                    f"salvate (totale finora: {total_rows})."
+                )
 
-            print(f"\nCompletato. Righe totali salvate: {total_rows}  Database: {db_path}")
+            print("\nCausali trovate nell'intervallo:")
+            for causale, n in per_causale.most_common():
+                nuova = "" if causale in CAUSALI else "   <-- non presente nell'elenco CAUSALI"
+                print(f"  {causale:<30} {n:>5} righe  {ore_per_causale[causale]:>9.2f} ore{nuova}")
+            if any(c not in CAUSALI for c in per_causale):
+                print(
+                    "  Se una delle etichette segnalate non è una vera causale (es. un totale), "
+                    "aggiungi una sua parola a CAUSALI_PAROLE_ESCLUSE e rilancia."
+                )
+
+            if missing_days:
+                print(f"\n⚠️  {len(missing_days)} giorni NON letti (non trovati nella griglia):")
+                for d in missing_days:
+                    print(f"  - {d.isoformat()}")
+
+            print(
+                f"\nCompletato. Giorni letti: {total_days}  Righe totali salvate: {total_rows}  "
+                f"Database: {db_path}"
+            )
 
         finally:
             conn.close()
@@ -889,10 +1174,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--limit", type=int, default=0, help="Numero massimo di documenti da scaricare (0 = tutti)")
     p_dl.set_defaults(func=cmd_download)
 
-    p_cart = sub.add_parser("cartellino", help="Raccoglie ore per causale dal Cartellino, mese per mese, in un DB SQLite", parents=[common])
+    p_cart = sub.add_parser("cartellino", help="Raccoglie, giorno per giorno, le ore di tutte le causali dal Cartellino in un DB SQLite", parents=[common])
     p_cart.add_argument("--db", default="cartellino.db", help="Percorso del file SQLite di destinazione (default: cartellino.db)")
     p_cart.add_argument("--start", default="2017-08-29", help="Data di inizio, formato YYYY-MM-DD (default: 2017-08-29)")
     p_cart.add_argument("--end", default=None, help="Data di fine, formato YYYY-MM-DD (default: ieri)")
+    p_cart.add_argument(
+        "--solo-causali-note", action="store_true",
+        help="Estrae solo le causali dell'elenco CAUSALI (default: tutte le causali presenti)",
+    )
+    p_cart.add_argument(
+        "--escludi-zero", action="store_true",
+        help="Non salva le causali con 00:00 ore (default: le salva tutte)",
+    )
     p_cart.set_defaults(func=cmd_cartellino)
 
     return p
