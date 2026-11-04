@@ -28,12 +28,40 @@ python yt_transcripts.py "https://www.youtube.com/playlist?list=PLxxxxxxxx" -l i
 python yt_transcripts.py @NomeCanale --single-file --timestamps
 ```
 
+### In due passi: lista dei video → trascrizioni
+
+1. Salva la lista dei video senza scaricare nulla:
+
+   ```bash
+   python yt_transcripts.py @NomeCanale --save-list lista.txt
+   ```
+
+2. Se vuoi, apri `lista.txt` ed elimina o commenta con `#` i video che non ti interessano. Puoi anche aggiungere altri video.
+3. Scarica le trascrizioni dei video presenti nella lista:
+
+   ```bash
+   python yt_transcripts.py --from-list lista.txt
+   ```
+
+La lista è un file di testo con una riga per video, nel formato `URL<TAB>titolo`:
+
+```
+# Raccolta: Nome Canale
+https://www.youtube.com/watch?v=dQw4w9WgXcQ	Titolo del video
+https://youtu.be/xxxxxxxxxxx
+xxxxxxxxxxx
+```
+
+Per ogni riga basta l'URL del video (`watch?v=`, `youtu.be/`, `shorts/`...) o il suo id. Se il titolo manca, lo script lo recupera da YouTube. La riga `# Raccolta:` dà il nome alla cartella di output; se non c'è, si usa il nome del file.
+
 Si possono passare anche forme brevi: `@handle`, l'id del canale (`UC...`) o l'id della playlist (`PL...`).
 
 ### Opzioni principali
 
 | Opzione | Descrizione |
 |---|---|
+| `--save-list FILE` | salva solo la lista dei video in `FILE` ed esce |
+| `--from-list FILE` | scarica le trascrizioni dei video elencati in `FILE` (al posto dell'URL) |
 | `-o, --output-dir` | cartella di destinazione (default `trascrizioni`) |
 | `-l, --languages` | lingue preferite in ordine di priorità (default `it,en`) |
 | `--translate` | se manca la lingua richiesta, usa la traduzione automatica di YouTube nella prima lingua |

@@ -8,6 +8,10 @@ Esempi:
     python yt_transcripts.py "https://www.youtube.com/playlist?list=PLxxxx" -l it,en
     python yt_transcripts.py @NomeCanale --single-file --timestamps
 
+    # In due passi: salva la lista dei video, (eventualmente la modifichi) e poi la usi
+    python yt_transcripts.py @NomeCanale --save-list lista.txt
+    python yt_transcripts.py --from-list lista.txt
+
 Dipendenze:  pip install -r requirements.txt
 """
 
@@ -147,6 +151,75 @@ def list_videos(url: str, args: argparse.Namespace) -> tuple[str, list[Video]]:
         walk(info)
 
     return collection_title, videos
+
+
+# --------------------------------------------------------------------------- #
+# Lista dei video su file (salvataggio / caricamento)
+# --------------------------------------------------------------------------- #
+_VIDEO_ID_RE = re.compile(
+    r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/|/v/)([\w-]{11})(?![\w-])"
+)
+
+
+def extract_video_id(text: str) -> str | None:
+    """Estrae l'id del video da un URL YouTube o da un id di 11 caratteri."""
+    text = text.strip()
+    if re.fullmatch(r"[\w-]{11}", text):
+        return text
+    m = _VIDEO_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
+def save_video_list(path: Path, collection: str, source_url: str, videos: list[Video]) -> None:
+    """Formato: una riga per video, 'URL<TAB>titolo'. Le righe con '#' sono commenti."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"# Raccolta: {collection}\n")
+        f.write(f"# Sorgente: {source_url}\n")
+        f.write(f"# Video: {len(videos)}\n")
+        f.write("# Formato: URL<TAB>titolo  -  elimina o commenta (#) le righe da escludere\n")
+        for v in videos:
+            title = re.sub(r"\s+", " ", v.title).strip()
+            f.write(f"{v.url}\t{title}\n")
+
+
+def _fetch_title(video_id: str, args: argparse.Namespace) -> str | None:
+    """Titolo tramite l'endpoint oEmbed (una richiesta leggera, senza scaricare la pagina)."""
+    url = f"https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v={video_id}"
+    try:
+        with yt_dlp.YoutubeDL(_ydl_base_opts(args)) as ydl:
+            return json.loads(ydl.urlopen(url).read().decode("utf-8")).get("title")
+    except Exception:
+        return None
+
+
+def load_video_list(path: Path, args: argparse.Namespace) -> tuple[str, list[Video]]:
+    """Legge una lista di video. Accetta righe 'URL<TAB>titolo', solo URL o solo id."""
+    collection = path.stem
+    videos: list[Video] = []
+    seen: set[str] = set()
+    for n, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            m = re.match(r"#\s*Raccolta:\s*(.+)", line)
+            if m:
+                collection = m.group(1).strip()
+            continue
+        ref, _, title = line.partition("\t")
+        vid = extract_video_id(ref)
+        if not vid:
+            print(f"  riga {n} ignorata (video non riconosciuto): {line[:80]}", file=sys.stderr)
+            continue
+        if vid in seen:
+            continue
+        seen.add(vid)
+        title = title.strip() or _fetch_title(vid, args) or vid
+        videos.append(Video(vid, title, f"https://www.youtube.com/watch?v={vid}"))
+        if args.limit and len(videos) >= args.limit:
+            break
+    return collection, videos
 
 
 # --------------------------------------------------------------------------- #
@@ -301,7 +374,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Scarica le trascrizioni di tutti i video di un canale o playlist YouTube.",
     )
-    p.add_argument("url", help="URL del canale/playlist (anche '@handle', id canale 'UC...' o id playlist 'PL...')")
+    p.add_argument("url", nargs="?",
+                   help="URL del canale/playlist (anche '@handle', id canale 'UC...' o id playlist 'PL...')")
+    p.add_argument("--save-list", metavar="FILE",
+                   help="salva la lista dei video del canale/playlist in FILE ed esci, senza scaricare le trascrizioni")
+    p.add_argument("--from-list", metavar="FILE",
+                   help="scarica le trascrizioni dei video elencati in FILE (creato con --save-list o scritto a mano)")
     p.add_argument("-o", "--output-dir", default="trascrizioni", help="cartella di destinazione (default: trascrizioni)")
     p.add_argument("-l", "--languages", default="it,en",
                    help="lingue preferite in ordine di priorità, separate da virgola (default: it,en)")
@@ -319,23 +397,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cookies", help="file cookies.txt (formato Netscape) per video con restrizioni")
     p.add_argument("--proxy", help="proxy HTTP/HTTPS, es. http://utente:pass@host:porta")
     args = p.parse_args(argv)
+    if args.from_list and args.url:
+        p.error("indica un URL oppure --from-list, non entrambi")
+    if args.from_list and args.save_list:
+        p.error("--save-list e --from-list non possono essere usati insieme")
+    if not args.from_list and not args.url:
+        p.error("serve l'URL di un canale/playlist oppure --from-list FILE")
     args.languages = [l.strip() for l in args.languages.split(",") if l.strip()] or ["en"]
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    url = normalize_url(args.url)
-
-    print(f"Recupero l'elenco dei video da {url} ...")
-    try:
-        collection, videos = list_videos(url, args)
-    except Exception as exc:
-        print(f"Errore: impossibile ottenere l'elenco dei video: {exc}", file=sys.stderr)
-        return 1
+    if args.from_list:
+        list_path = Path(args.from_list)
+        if not list_path.is_file():
+            print(f"Errore: file non trovato: {list_path}", file=sys.stderr)
+            return 1
+        print(f"Leggo la lista dei video da {list_path} ...", flush=True)
+        collection, videos = load_video_list(list_path, args)
+    else:
+        url = normalize_url(args.url)
+        print(f"Recupero l'elenco dei video da {url} ...")
+        try:
+            collection, videos = list_videos(url, args)
+        except Exception as exc:
+            print(f"Errore: impossibile ottenere l'elenco dei video: {exc}", file=sys.stderr)
+            return 1
     if not videos:
         print("Nessun video trovato.")
         return 1
+
+    if args.save_list:
+        save_video_list(Path(args.save_list), collection, url, videos)
+        print(f"Salvata la lista di {len(videos)} video di «{collection}» in {args.save_list}")
+        print(f"Per scaricare le trascrizioni:  python {Path(sys.argv[0]).name} --from-list \"{args.save_list}\"")
+        return 0
+
     print(f"Trovati {len(videos)} video in «{collection}».\n")
 
     root = Path(args.output_dir)
