@@ -1,25 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Pipeline JevAI Playground - batch su una cartella di state.
+Pipeline NACE SystemOne - batch su una cartella di state.
 
 Per ogni file JSON trovato nella cartella indicata (anche nelle sottocartelle) e usato
-come "state", invia la richiesta definita in richiesta.json (stesse domande) a tutti
-i modelli selezionati, raccoglie le probabilità e produce un JSON con l'analisi completa:
+come "state", invia la richiesta definita in richiesta.json (stesse domande) all'API
+NACE (https://console.nace.ai/v1/systemone) per ciascun modello selezionato, raccoglie
+le risposte e produce un JSON con l'analisi completa:
   - filtro dei modelli troppo correlati (soglia r)
   - per ogni state e domanda: consenso tra modelli + test statistici
   - per ogni domanda: aggregati su tutti gli state, Fleiss kappa tra modelli
   - per ogni modello: profilo e accordo con il consenso
   - tutto sia sul dataset originale sia su quello filtrato
 
+Requisiti:  pip install httpx numpy pandas scipy statsmodels
+Chiave API: variabile d'ambiente NACE_API_KEY (mai scritta nel codice)
+  Windows PowerShell:  $env:NACE_API_KEY = "nace_sk_..."
+  Linux/macOS:         export NACE_API_KEY="nace_sk_..."
+
 Uso:
-  python jevai.py CARTELLA_STATE --richiesta richiesta.json --r 0.90             # primo run (headed): login
-  python jevai.py CARTELLA_STATE --richiesta richiesta.json --r 0.90 --headless  # run successivi
-  python jevai.py --analyze-only output_raw.json --r 0.85                        # solo analisi
+  python jevai.py CARTELLA_STATE --richiesta richiesta.json --r 0.90
+  python jevai.py CARTELLA_STATE --models drex-max-v1.1,altro-modello --r 0.90
+  python jevai.py --analyze-only output_raw.json --r 0.85                 # solo analisi
 
 In richiesta.json:
   - "state" è ignorato (viene sostituito da ciascun file della cartella; può restare un segnaposto)
-  - "model": un id di modello preciso, oppure un segnaposto (es. "xxxx", "", "all") per
-    interrogare tutti i modelli del menu a tendina (meno SKIP_MODELS). --models ha la precedenza.
+  - "model": id del modello NACE, oppure un segnaposto (es. "xxxx") per usare il default
+    (drex-max-v1.1). --models (lista separata da virgole) ha la precedenza.
+    I test tra modelli (correlazione, Fleiss kappa, z/chi/ANOVA per state) richiedono >= 2 modelli.
 """
 import argparse
 import copy
@@ -40,42 +47,29 @@ import statsmodels.stats.proportion as smp
 import statsmodels.stats.inter_rater as irr
 
 # ============================== CONFIG ==============================
-URL = "https://thejevai.com/playground"
+NACE_URL = os.environ.get("NACE_URL", "https://console.nace.ai/v1/systemone")
+NACE_CLIENT = os.environ.get("NACE_CLIENT", "nace-quickstart/1")
+DEFAULT_MODEL = "drex-max-v1.1"
+
 RAW_OUT = "output_raw.json"
 FILTERED_OUT = "output_filtered.json"
 REPORT_OUT = "analisi_statistica.json"
-AUTH_STATE = "auth_state.json"
-OUTPUT_NAMES = {RAW_OUT, FILTERED_OUT, REPORT_OUT, AUTH_STATE}  # mai trattati come state
+OUTPUT_NAMES = {RAW_OUT, FILTERED_OUT, REPORT_OUT}  # mai trattati come state
 
 DEFAULT_R = 0.87
 DEFAULT_RICHIESTA = "richiesta.json"
 RESULT_TIMEOUT_S = 120
-PAUSE_S = 1.5
-API_REGEX = re.compile(r"(systemone|decision|decide|generate)", re.I)
-SKIP_MODELS = {"convaiinnovations/laya"}  # consuma crediti account: escluso di default
+PAUSE_S = 1.0
 
 YES_ALIASES = {"yes", "y", "si", "sì", "true", "vero", "1"}
 NO_ALIASES = {"no", "n", "false", "falso", "0"}
 
-GH_USER = os.environ.get("JEVAI_GH_USER", "")
-GH_PASS = os.environ.get("JEVAI_GH_PASS", "")
+
+class FatalAPIError(RuntimeError):
+    """Errore che rende inutile proseguire (es. chiave API non valida)."""
 
 
 # ============================== UTILITY ==============================
-def debug_dump(page, tag="login_fail"):
-    try:
-        page.screenshot(path=f"{tag}.png", full_page=True)
-        Path(f"{tag}.html").write_text(page.content(), encoding="utf-8")
-        print(f">> Dump salvato: {tag}.png / {tag}.html")
-    except Exception:
-        pass
-    try:
-        buttons = [b.strip() for b in page.get_by_role("button").all_inner_texts() if b.strip()]
-        print(f">> Bottoni nella pagina ({len(buttons)}): {buttons[:40]}")
-    except Exception:
-        pass
-
-
 def ask_threshold(cli_value):
     if cli_value is not None:
         r = cli_value
@@ -157,25 +151,6 @@ def extract_json(text):
                     except json.JSONDecodeError:
                         return None
     return None
-
-
-def locate_request_body(j):
-    if isinstance(j, dict):
-        if "questions" in j and "model" in j:
-            return j
-        for v in j.values():
-            r = locate_request_body(v)
-            if r is not None:
-                return r
-    return None
-
-
-def safe_headers(h):
-    keep = {}
-    for k, v in h.items():
-        if k.lower().startswith(("content-type", "accept", "authorization", "x-", "user-agent")):
-            keep[k] = v
-    return keep
 
 
 # ============================== INPUT: RICHIESTA E STATE ==============================
@@ -270,92 +245,133 @@ def norm_label(label, q, categories):
     return None
 
 
-def _is_decision(d):
-    return isinstance(d, dict) and ("probabilities" in d or "choice" in d)
+
+def _float(x):
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
 
 
-def find_decision(obj, qid):
-    """Cerca nella risposta il blocco decisione della domanda qid (ignora l'eco delle domande)."""
+def map_probs(d, q, categories):
+    """Dizionario {etichetta: probabilità} -> {categoria: probabilità} (solo voci riconosciute)."""
+    probs = {}
+    for k, v in d.items():
+        c = norm_label(k, q, categories)
+        v = _float(v) if not isinstance(v, bool) else None
+        if c is not None and v is not None:
+            probs[c] = probs.get(c, 0.0) + v
+    return probs
+
+
+def value_to_decision(val, q, categories, depth=0):
+    """
+    Converte la risposta NACE di una domanda (answers[qid][type]) in
+    {choice, probabilities, confidence, tipo_valore}. Formati gestiti:
+      numero 0-1 (o 0-100)  -> probabilità di "yes" (domande binarie)
+      bool / "yes" / "no"   -> risposta categorica (probabilità 1/0)
+      {"probabilities": {...}, "choice": ..., "confidence": ...}
+      {"yes": 0.8, "no": 0.2}  o  {"value"/"probability"/"answer"/...: <uno dei precedenti>}
+    """
+    binary = len(categories) == 2
+    conf, choice, probs, kind = None, None, None, None
+
+    if isinstance(val, dict):
+        conf = _float(val.get("confidence"))
+        for key in ("choice", "answer", "label", "decision"):
+            choice = norm_label(val.get(key), q, categories)
+            if choice:
+                break
+        if isinstance(val.get("probabilities"), dict):
+            probs, kind = map_probs(val["probabilities"], q, categories), "probabilities"
+        else:
+            probs, kind = map_probs(val, q, categories), "probabilities"
+        if not probs:
+            probs = None
+            if depth < 3:
+                for key in (q.get("type"), "value", "probability", "prob", "p", "p_yes", "score",
+                            "result", "answer", "choice", "label", "decision", "noul"):
+                    if key and key in val and val[key] is not None:
+                        inner = value_to_decision(val[key], q, categories, depth + 1)
+                        if inner[0]:
+                            d = inner[0]
+                            if conf is not None and d["confidence"] is None:
+                                d["confidence"] = conf
+                            if choice and choice != d["choice"] and d["tipo_valore"] == "categorica":
+                                d["choice"] = choice
+                            return d, None
+            if choice is None:
+                return None, f"formato risposta non riconosciuto: {json.dumps(val, ensure_ascii=False)[:150]}"
+            probs, kind = {choice: 1.0}, "categorica"
+    elif isinstance(val, bool):
+        if not binary:
+            return None, f"valore booleano per domanda non binaria: {val}"
+        probs, kind = {categories[0]: 1.0 if val else 0.0}, "categorica"
+    elif isinstance(val, (int, float)):
+        v = _float(val)
+        if v is None or not binary:
+            return None, f"valore numerico non interpretabile: {val}"
+        probs, kind = {categories[0]: v / 100 if v > 1 else v}, "probabilita_yes"
+    elif isinstance(val, str):
+        c = norm_label(val, q, categories)
+        if c is not None:
+            probs, kind = {c: 1.0}, "categorica"
+        elif _float(val.strip().rstrip("%")) is not None and binary:
+            v = _float(val.strip().rstrip("%"))
+            probs, kind = {categories[0]: v / 100 if v > 1 else v}, "probabilita_yes"
+        else:
+            return None, f"valore non riconosciuto: {val[:150]}"
+    else:
+        return None, f"tipo di risposta non gestito: {type(val).__name__}"
+
+    if sum(probs.values()) > 1.5:  # espresse in percentuale
+        probs = {c: v / 100 for c, v in probs.items()}
+    if binary and len(probs) == 1:
+        (c, v), = probs.items()
+        probs[categories[1] if c == categories[0] else categories[0]] = max(0.0, 1.0 - v)
+    vec = [probs.get(c, 0.0) for c in categories]
+    if choice is None:
+        choice = categories[int(np.argmax(vec))]
+    return {"choice": choice, "probabilities": dict(zip(categories, vec)),
+            "confidence": conf, "tipo_valore": kind}, None
+
+
+def _find_key(obj, key):
     if isinstance(obj, dict):
-        v = obj.get(qid)
-        if _is_decision(v):
-            return v
-        if _is_decision(obj) and any(obj.get(k) == qid for k in ("id", "question", "question_id", "name", "key")):
-            return obj
-        for v in obj.values():
-            r = find_decision(v, qid)
-            if r is not None:
-                return r
-    elif isinstance(obj, list):
-        for v in obj:
-            r = find_decision(v, qid)
-            if r is not None:
-                return r
-    return None
-
-
-def find_any_decision(obj):
-    if isinstance(obj, dict):
-        if "probabilities" in obj:
-            return obj
+        if key in obj:
+            return obj[key]
         children = obj.values()
     elif isinstance(obj, list):
         children = obj
     else:
         return None
     for v in children:
-        r = find_any_decision(v)
+        r = _find_key(v, key)
         if r is not None:
             return r
     return None
 
 
-def normalize_decision(raw, q, categories):
-    probs_raw = raw.get("probabilities")
-    if not isinstance(probs_raw, dict) or not probs_raw:
-        return None, "risposta senza probabilities"
-    probs = {}
-    for k, v in probs_raw.items():
-        c = norm_label(k, q, categories)
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            continue
-        if c is not None:
-            probs[c] = probs.get(c, 0.0) + v
-    if not probs:
-        return None, f"categorie non riconosciute: {list(probs_raw)[:6]}"
-    if sum(probs.values()) > 1.5:  # espresse in percentuale
-        probs = {c: v / 100 for c, v in probs.items()}
-    if len(categories) == 2 and len(probs) == 1:
-        (c, v), = probs.items()
-        probs[categories[1] if c == categories[0] else categories[0]] = max(0.0, 1.0 - v)
-    vec = [probs.get(c, 0.0) for c in categories]
-
-    choice = None
-    for key in ("choice", "answer", "decision"):
-        choice = norm_label(raw.get(key), q, categories)
-        if choice:
-            break
-    if choice is None:
-        choice = categories[int(np.argmax(vec))]
-    try:
-        conf = float(raw.get("confidence"))
-    except (TypeError, ValueError):
-        conf = None
-    return {"choice": choice, "probabilities": dict(zip(categories, vec)), "confidence": conf}, None
-
-
 def parse_response(j, questions):
+    """Risposta NACE -> (decisioni normalizzate, errori per domanda)."""
+    answers = j.get("answers") if isinstance(j, dict) else None
+    if not isinstance(answers, dict):
+        answers = None
     decisions, errors = {}, {}
     for qid, q in questions.items():
-        raw = find_decision(j, qid)
-        if raw is None and len(questions) == 1:
-            raw = find_any_decision(j)
-        if raw is None:
+        a = answers.get(qid) if answers is not None else _find_key(j, qid)
+        if a is None:
             errors[qid] = "domanda assente nella risposta"
             continue
-        d, err = normalize_decision(raw, q, question_categories(q))
+        if isinstance(a, dict) and q.get("type") in a:  # es. answers["Funzioni"]["noul"]
+            outer_conf = _float(a.get("confidence"))
+            inner = a[q.get("type")]
+            if isinstance(inner, dict) or outer_conf is None:
+                a = inner
+            else:
+                a = {"value": inner, "confidence": outer_conf}
+        d, err = value_to_decision(a, q, question_categories(q))
         if d:
             decisions[qid] = d
         else:
@@ -363,248 +379,142 @@ def parse_response(j, questions):
     return decisions, errors
 
 
-# ============================== LOGIN ==============================
-def complete_github_login(page):
-    """Completa il login GitHub quando JevAI lo richiede dopo Generate decisions."""
-    if not GH_USER or not GH_PASS:
-        raise RuntimeError("Imposta JEVAI_GH_USER e JEVAI_GH_PASS nelle variabili d'ambiente.")
-
-    page.get_by_role("button", name="Sign in with GitHub").click(timeout=15_000)
-    page.get_by_role("textbox", name="Username or email address").fill(GH_USER, timeout=20_000)
-    page.get_by_role("textbox", name="Password").fill(GH_PASS, timeout=20_000)
-    page.get_by_role("button", name="Sign in", exact=True).click()
-    print(">> Credenziali GitHub inviate. Eventuale 2FA/device verification: completa a mano...")
-    page.wait_for_url(re.compile(r"thejevai\.com/playground"), timeout=180_000)
-    page.get_by_role("button", name="Generate decisions").wait_for(timeout=30_000)
-    page.context.storage_state(path=AUTH_STATE)
-    print(f">> Login OK, sessione salvata in {AUTH_STATE}.")
+# ============================== FASE 0: RACCOLTA VIA API NACE ==============================
+def nace_headers():
+    key = os.environ.get("NACE_API_KEY", "").strip()
+    if not key:
+        sys.exit("Imposta la variabile d'ambiente NACE_API_KEY con la tua chiave NACE (nace_sk_...).")
+    return {"Authorization": f"Bearer {key}", "X-Nace-Client": NACE_CLIENT}
 
 
-def login(page):
-    page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=15_000)
-    except Exception:
-        pass
+def state_payload(state_obj, mode):
+    if mode == "testo" and not isinstance(state_obj, str):
+        return json.dumps(state_obj, ensure_ascii=False, indent=1)
+    return state_obj
 
-    try:
-        page.get_by_role("button", name=re.compile(r"accept|accetta|agree|consenti|allow all", re.I)).first.click(timeout=2500)
-    except Exception:
-        pass
 
-    if page.get_by_role("button", name="Generate decisions").count() > 0:
-        print(">> Sessione già attiva: login saltato.")
-        return
+def call_nace(client, model, state_obj, req, opts):
+    """
+    Invia richiesta.json (con model e state sostituiti).
+    Restituisce (risposta_grezza, decisioni, errori_per_domanda, errore_globale).
+    opts["state_mode"]: "json" (oggetto), "testo" (JSON serializzato in stringa) o "auto"
+    (prova l'oggetto e, se l'API lo rifiuta con 400/422, ripiega sulla stringa).
+    """
+    import httpx
 
-    candidates = [
-        page.get_by_role("button", name=re.compile(r"sign in with github", re.I)),
-        page.get_by_role("link", name=re.compile(r"sign in with github", re.I)),
-        page.get_by_text(re.compile(r"sign in with github", re.I)),
-        page.locator("text=/github/i"),
-    ]
-    clicked = False
-    for loc in candidates:
+    body = {k: copy.deepcopy(v) for k, v in req.items() if k not in ("model", "state")}
+    body["model"] = model
+    mode = "json" if opts["state_mode"] == "auto" else opts["state_mode"]
+    can_fallback = opts["state_mode"] == "auto" and not isinstance(state_obj, str)
+    attempt = 0
+    while True:
+        body["state"] = state_payload(state_obj, mode)
         try:
-            loc.first.click(timeout=6000)
-            clicked = True
-            break
-        except Exception:
+            resp = client.post(NACE_URL, json=body)
+        except httpx.TransportError as e:
+            if attempt < 3:
+                attempt += 1
+                time.sleep(5 * attempt)
+                continue
+            return None, {}, {}, f"errore di rete: {str(e)[:120]}"
+
+        if resp.status_code in (401, 403):
+            raise FatalAPIError(f"HTTP {resp.status_code}: chiave NACE_API_KEY non valida o senza permessi "
+                                f"({resp.text[:150]})")
+        if (resp.status_code == 429 or resp.status_code >= 500) and attempt < 4:
+            attempt += 1
+            wait = _float(resp.headers.get("retry-after")) or 6 * attempt
+            time.sleep(min(wait, 120))
             continue
-    if not clicked:
-        debug_dump(page, "login_fail")
-        raise RuntimeError("Pulsante GitHub non trovato: guarda login_fail.png/.html")
-
-    try:
-        page.wait_for_url(re.compile(r"github\.com"), timeout=15_000)
-    except Exception:
-        pass
-
-    if "github.com" in page.url:
-        user_box = page.get_by_role("textbox", name="Username or email address")
-        try:
-            user_box.fill(GH_USER, timeout=8000)
-        except Exception:
-            for alt in (r"use.*password", r"sign in with.*password", r"another method", r"password"):
-                done = False
-                for role in ("button", "link"):
-                    try:
-                        page.get_by_role(role, name=re.compile(alt, re.I)).first.click(timeout=3000)
-                        done = True
-                        break
-                    except Exception:
-                        continue
-                if done:
-                    break
-            user_box.fill(GH_USER, timeout=8000)
-        page.get_by_role("textbox", name="Password").fill(GH_PASS)
-        page.get_by_role("button", name="Sign in", exact=True).click()
-        print(">> Credenziali inviate. Eventuale 2FA/device verification: completa a mano (max 180s)...")
-
-    page.wait_for_url(re.compile(r"thejevai\.com/playground"), timeout=180_000)
-    page.get_by_role("button", name="Generate decisions").wait_for(timeout=30_000)
-    page.context.storage_state(path=AUTH_STATE)
-    print(f">> Login OK, sessione salvata in {AUTH_STATE}.")
-
-
-# ============================== FASE 0: RACCOLTA VIA API ==============================
-def list_models(page):
-    sel = page.get_by_label(re.compile(r"^Model", re.I)).first
-    values = sel.locator("option").evaluate_all("els => els.map(e => e.value)")
-    out, seen = [], set()
-    for v in values:
-        v = (v or "").strip().lstrip("~").strip()
-        if v and v.lower() not in ("", "select", "none") and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-
-def discover_api(page):
-    """Un click su Generate (preset di default) per catturare endpoint, header e payload reali."""
-    captured = {}
-
-    def on_request(req):
-        try:
-            if req.method == "POST" and API_REGEX.search(req.url) and req.post_data:
-                j = json.loads(req.post_data)
-                if locate_request_body(j) is not None:
-                    captured["url"] = req.url
-                    captured["headers"] = safe_headers(req.headers)
-                    captured["payload"] = j
-        except Exception:
-            pass
-
-    page.on("request", on_request)
-    print(">> Intercetto l'endpoint API con un run del preset di default...")
-    page.get_by_role("button", name="Generate decisions").click()
-
-    # Su alcune sessioni il login GitHub viene richiesto solo al primo Generate.
-    github_login = page.get_by_role("button", name="Sign in with GitHub")
-    try:
-        github_login.wait_for(state="visible", timeout=4000)
-    except Exception:
-        pass
-    else:
-        complete_github_login(page)
-        # Il primo click ha aperto il login: ripeti Generate dopo l'autenticazione.
-        page.get_by_role("button", name="Generate decisions").click()
-
-    t0 = time.time()
-    while "url" not in captured and time.time() - t0 < 60:
-        page.wait_for_timeout(300)
-    page.remove_listener("request", on_request)
-
-    if "url" not in captured:
-        debug_dump(page, "api_fail")
-        raise RuntimeError("Endpoint API non intercettato: guarda api_fail.png/.html")
-    print(f">> Endpoint catturato: {captured['url']}")
-    return captured
-
-
-def call_model(context, api, model, state_obj, req):
-    """Invia richiesta.json (con model e state sostituiti) e restituisce (decisioni, errori, errore_globale)."""
-    body = copy.deepcopy(api["payload"])
-    target = locate_request_body(body) or body
-    for k, v in req.items():
-        if k not in ("model", "state"):
-            target[k] = copy.deepcopy(v)
-    target["model"] = model
-    target["state"] = state_obj
-
-    for attempt in range(3):
-        resp = context.request.post(
-            api["url"],
-            headers=api["headers"],
-            data=json.dumps(body, ensure_ascii=False),
-            timeout=RESULT_TIMEOUT_S * 1000,
-        )
-        if (resp.status == 429 or resp.status >= 500) and attempt < 2:
-            time.sleep(6 * (attempt + 1))
+        if resp.status_code in (400, 422) and can_fallback and mode == "json":
+            mode = "testo"  # l'API potrebbe accettare solo state testuale
             continue
-        if not resp.ok:
-            return {}, {}, f"HTTP {resp.status}: {resp.text()[:120]}"
+        if resp.status_code >= 400:
+            return None, {}, {}, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
         try:
             j = resp.json()
         except Exception:
-            j = extract_json(resp.text())
+            j = extract_json(resp.text)
         if not j:
-            return {}, {}, "risposta non JSON"
+            return None, {}, {}, "risposta non JSON"
+        if opts["state_mode"] == "auto":
+            opts["state_mode"] = mode
+            print(f"[state inviato come {'oggetto JSON' if mode == 'json' else 'testo'}] ", end="")
+        raw_answers = j.get("answers", j) if isinstance(j, dict) else j
         decisions, errors = parse_response(j, req["questions"])
         if not decisions:
-            return {}, errors, "nessuna decisione valida nella risposta"
-        return decisions, errors, None
-    return {}, {}, "rate limit / errore server persistente"
+            return raw_answers, {}, errors, "nessuna risposta interpretabile"
+        return raw_answers, decisions, errors, None
 
 
-def collect(states, req, folder, models_cli=None, headless=False, pause=PAUSE_S):
-    from playwright.sync_api import sync_playwright
+def resolve_models(req, models_cli):
+    if models_cli:
+        return [m.strip() for m in models_cli if m.strip()]
+    return [requested_model(req) or DEFAULT_MODEL]
 
-    if not GH_USER or not GH_PASS:
-        sys.exit("Imposta JEVAI_GH_USER e JEVAI_GH_PASS nelle variabili d'ambiente.")
+
+def collect(states, req, folder, models, pause=PAUSE_S, state_mode="auto"):
+    try:
+        import httpx
+    except ImportError:
+        sys.exit("Manca httpx: pip install httpx")
+    headers = nace_headers()
 
     raw = {
         "generato": datetime.now().isoformat(timespec="seconds"),
+        "endpoint": NACE_URL,
         "cartella_state": str(folder),
         "richiesta": {k: v for k, v in req.items() if k != "state"},
         "state_files": [rel for rel, _ in states],
-        "modelli": [],
+        "modelli": models,
         "records": [],
     }
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx_kwargs = {"storage_state": AUTH_STATE} if Path(AUTH_STATE).exists() else {}
-        context = browser.new_context(**ctx_kwargs)
-        page = context.new_page()
+    total = len(models) * len(states)
+    print(f">> {len(models)} modelli x {len(states)} state = {total} richieste a {NACE_URL}")
+    if len(models) < 2:
+        print("   (con un solo modello i test tra modelli non sono calcolabili: usa --models m1,m2,...)")
 
-        login(page)
-        fixed = requested_model(req)
-        if models_cli:
-            models = models_cli
-        elif fixed:
-            models = [fixed]
-        else:
-            models = [m for m in list_models(page) if m not in SKIP_MODELS]
-        raw["modelli"] = models
-        total = len(models) * len(states)
-        print(f">> {len(models)} modelli x {len(states)} state = {total} richieste "
-              f"(esclusi: {sorted(SKIP_MODELS)}).")
-
-        api = discover_api(page)
-
-        i = 0
-        for rel, state_obj in states:
-            print(f"\n== State: {rel}")
-            for m in models:
-                i += 1
-                print(f">> [{i}/{total}] {m} ... ", end="", flush=True)
-                rec = {"state": rel, "model": m}
-                try:
-                    decisions, errors, err = call_model(context, api, m, state_obj, req)
-                    rec["decisions"] = decisions
-                    if errors:
-                        rec["errors"] = errors
-                    if err:
-                        rec["error"] = err
-                        print(f"SKIP ({err})")
-                    else:
-                        summary = ", ".join(f"{q}={d['choice']}" for q, d in decisions.items())
-                        print(f"OK ({summary})" + (f"  [mancanti: {list(errors)}]" if errors else ""))
-                except Exception as e:
-                    rec["decisions"] = {}
-                    rec["error"] = str(e)[:200]
-                    print(f"ERRORE: {str(e)[:80]}")
-                raw["records"].append(rec)
-                write_json(RAW_OUT, raw)  # salvataggio progressivo
-                time.sleep(pause)
-
-        browser.close()
+    opts = {"state_mode": state_mode}
+    i = 0
+    with httpx.Client(headers=headers, timeout=RESULT_TIMEOUT_S) as client:
+        try:
+            for rel, state_obj in states:
+                print(f"\n== State: {rel}")
+                for m in models:
+                    i += 1
+                    print(f">> [{i}/{total}] {m} ... ", end="", flush=True)
+                    rec = {"state": rel, "model": m}
+                    try:
+                        answers, decisions, errors, err = call_nace(client, m, state_obj, req, opts)
+                        rec["decisions"] = decisions
+                        rec["risposta"] = answers
+                        if errors:
+                            rec["errors"] = errors
+                        if err:
+                            rec["error"] = err
+                            print(f"SKIP ({err})" + (f" {errors}" if errors else ""))
+                        else:
+                            summary = ", ".join(f"{q}={d['choice']}" for q, d in decisions.items())
+                            print(f"OK ({summary})" + (f"  [problemi: {errors}]" if errors else ""))
+                    except FatalAPIError:
+                        raise
+                    except Exception as e:
+                        rec["decisions"] = {}
+                        rec["error"] = str(e)[:200]
+                        print(f"ERRORE: {str(e)[:80]}")
+                    raw["records"].append(rec)
+                    write_json(RAW_OUT, raw)  # salvataggio progressivo
+                    time.sleep(pause)
+        except FatalAPIError as e:
+            write_json(RAW_OUT, raw)
+            sys.exit(f"\n!! {e}")
+        except KeyboardInterrupt:
+            print("\n!! Interrotto dall'utente: analizzo quanto raccolto finora.")
+            write_json(RAW_OUT, raw)
 
     print(f"\n>> Raccolta completata: {RAW_OUT}")
     return raw
-
 
 # ============================== DATASET ==============================
 def build_observations(records, questions):
@@ -850,12 +760,14 @@ def print_summary(an, questions):
 
 # ============================== MAIN ==============================
 def main():
-    ap = argparse.ArgumentParser(description="Batch JevAI: richiesta.json x tutti gli state di una cartella.")
+    ap = argparse.ArgumentParser(description="Batch NACE SystemOne: richiesta.json x tutti gli state di una cartella.")
     ap.add_argument("cartella", nargs="?", help="cartella con i file JSON di state (ricerca ricorsiva)")
     ap.add_argument("--richiesta", default=None, help=f"file richiesta (default: {DEFAULT_RICHIESTA})")
     ap.add_argument("--analyze-only", metavar="FILE", help="salta la raccolta, analizza questo output_raw.json")
-    ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--models", help="lista modelli separati da virgola (precedenza su 'model' di richiesta.json)")
+    ap.add_argument("--models", help=f"modelli NACE separati da virgola (default: 'model' di richiesta.json "
+                                     f"o {DEFAULT_MODEL})")
+    ap.add_argument("--state-formato", choices=("auto", "json", "testo"), default="auto",
+                    help="come inviare lo state: oggetto JSON, testo (JSON serializzato) o auto (default)")
     ap.add_argument("--r", type=float, default=None, help="soglia correlazione (se assente, chiesta da tastiera)")
     ap.add_argument("--pausa", type=float, default=PAUSE_S, help="secondi di pausa tra richieste")
     ap.add_argument("--out", default=REPORT_OUT, help=f"file JSON dell'analisi (default: {REPORT_OUT})")
@@ -870,6 +782,7 @@ def main():
             sys.exit("Formato non riconosciuto: serve un output_raw.json prodotto da questa versione dello script.")
         richiesta_path = None
     else:
+        nace_headers()  # verifica subito la presenza della chiave
         folder = args.cartella or input("Percorso della cartella con gli state JSON: ").strip().strip('"')
         if not folder:
             sys.exit("Cartella degli state non specificata.")
@@ -887,14 +800,14 @@ def main():
 
         root, files = find_state_files(folder, exclude=[richiesta_path, args.out])
         states, invalid_states = load_states(root, files)
-        raw = collect(states, req, root, args.models.split(",") if args.models else None,
-                      args.headless, args.pausa)
+        models = resolve_models(req, args.models.split(",") if args.models else None)
+        raw = collect(states, req, root, models, args.pausa, args.state_formato)
 
     questions = raw["richiesta"]["questions"]
     records = raw["records"]
     obs = build_observations(records, questions)
     if not obs:
-        sys.exit("Nessuna decisione valida raccolta: analisi impossibile (vedi output_raw.json).")
+        sys.exit(f"Nessuna decisione valida raccolta: analisi impossibile (vedi {RAW_OUT}, campo 'risposta').")
 
     kept, filt_info = filter_correlated(obs, questions, r_threshold)
     obs_f = [o for o in obs if o["model"] in kept]
@@ -907,10 +820,12 @@ def main():
 
     failures = [{"state": r["state"], "model": r["model"], "errore": r.get("error"), "domande": r.get("errors")}
                 for r in records if r.get("error") or r.get("errors")]
+    tipi = Counter(d.get("tipo_valore") for r in records for d in (r.get("decisions") or {}).values())
     report = {
         "meta": {
             "generato": datetime.now().isoformat(timespec="seconds"),
             "raccolta": raw.get("generato"),
+            "endpoint": raw.get("endpoint"),
             "cartella_state": raw.get("cartella_state"),
             "richiesta": str(richiesta_path) if richiesta_path else args.analyze_only,
             "soglia_correlazione": r_threshold,
@@ -923,6 +838,9 @@ def main():
             "richieste_totali": len(records),
             "richieste_ok": sum(1 for r in records if r.get("decisions") and not r.get("error")),
             "decisioni_valide": len(obs),
+            "formato_risposte": dict(tipi),
+            "nota_formato": ("risposte categoriche (yes/no): probabilità 1/0, test su probabilità poco informativi"
+                             if tipi.get("categorica") else ""),
             "fallimenti": failures,
         },
         "filtro_correlazione": filt_info,
